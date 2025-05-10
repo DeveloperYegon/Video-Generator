@@ -1,0 +1,69 @@
+{% extends "core/base.html" %}
+
+{% block title %}Edit Script - {{ project.title }}{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const generateBtn = document.getElementById('generate-script-btn');
+    if (generateBtn) {
+        generateBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            const topic = prompt('Enter a topic for AI generation:');
+            if (topic) {
+                fetch(`{% url 'videos:generate_script' project.id %}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-CSRFToken': '{{ csrf_token }}'
+                    },
+                    body: `topic=${encodeURIComponent(topic)}&length=300`
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        document.getElementById('id_text').value = data.text;
+                    }
+                });
+            }
+        });
+    }
+});
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-10">
+        <h2 class="mb-4">Edit Script: {{ project.title }}</h2>
+
+        <div class="d-flex justify-content-between mb-3">
+            <a href="{% url 'videos:view_project' project.id %}" class="btn btn-outline-secondary">
+                Back to Project
+            </a>
+            <button id="generate-script-btn" class="btn btn-outline-primary">
+                Generate with AI
+            </button>
+        </div>
+
+        <form method="post">
+            {% csrf_token %}
+            <div class="mb-3">
+                {{ form.text.label_tag }}
+                {{ form.text }}
+                {% if form.text.errors %}
+                    <div class="invalid-feedback d-block">
+                        {{ form.text.errors }}
+                    </div>
+                {% endif %}
+            </div>
+            <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                <button type="submit" class="btn btn-primary">Save Script</button>
+                <a href="{% url 'videos:process_script' project.id %}" class="btn btn-success">
+                    Process Script
+                </a>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

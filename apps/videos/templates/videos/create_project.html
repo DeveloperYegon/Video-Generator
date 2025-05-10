@@ -1,0 +1,29 @@
+{% extends "core/base.html" %}
+
+{% block title %}Create New Project{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h2 class="mb-4">Create New Video Project</h2>
+        <form method="post">
+            {% csrf_token %}
+            <div class="mb-3">
+                {{ form.title.label_tag }}
+                {{ form.title }}
+                {% if form.title.errors %}
+                    <div class="invalid-feedback d-block">
+                        {{ form.title.errors }}
+                    </div>
+                {% endif %}
+            </div>
+            <div class="mb-3">
+                {{ form.description.label_tag }}
+                {{ form.description }}
+                <small class="form-text text-muted">Optional description for your project</small>
+            </div>
+            <button type="submit" class="btn btn-primary">Create Project</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

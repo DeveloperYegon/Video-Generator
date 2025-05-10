@@ -1,0 +1,34 @@
+{% extends "core/base.html" %}
+
+{% block title %}My Video Projects{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>My Video Projects</h2>
+        <a href="{% url 'videos:create_project' %}" class="btn btn-primary">
+            New Project
+        </a>
+    </div>
+
+    {% if projects %}
+    <div class="list-group">
+        {% for project in projects %}
+        <a href="{% url 'videos:view_project' project.id %}"
+           class="list-group-item list-group-item-action">
+            <div class="d-flex w-100 justify-content-between">
+                <h5 class="mb-1">{{ project.title }}</h5>
+                <small class="text-muted">{{ project.created_at|timesince }} ago</small>
+            </div>
+            <p class="mb-1">{{ project.description|truncatechars:100 }}</p>
+            <small class="text-muted">Status: {{ project.get_status_display }}</small>
+        </a>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="alert alert-info">
+        No projects found. Create your first video project!
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

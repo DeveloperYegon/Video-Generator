@@ -1,0 +1,33 @@
+{% extends "core/base.html" %}
+
+{% block title %}Render Error - {{ project.title }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card border-danger">
+            <div class="card-header bg-danger text-white">
+                <h4 class="mb-0">Video Rendering Failed</h4>
+            </div>
+            <div class="card-body">
+                <h5 class="card-title">Sorry, we couldn't render your video</h5>
+                <p class="card-text">
+                    The system encountered an error while trying to render your video for project
+                    <strong>{{ project.title }}</strong>.
+                </p>
+                <p class="card-text">
+                    You can try again or contact support if the problem persists.
+                </p>
+                <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                    <a href="{% url 'videos:view_project' project.id %}" class="btn btn-secondary">
+                        Back to Project
+                    </a>
+                    <a href="{% url 'videos:render_video' project.id %}" class="btn btn-primary">
+                        Try Again
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
