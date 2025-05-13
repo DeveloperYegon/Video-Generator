@@ -24,7 +24,7 @@ def create_project(request):
             project = form.save(commit=False)
             project.user = request.user
             project.save()
-            return redirect('edit_script', project_id=project.id)
+            return redirect('videos:edit_script', project_id=project.id)
     else:
         form = VideoProjectForm()
     return render(request, 'videos/create_project.html', {'form': form})
@@ -51,7 +51,7 @@ def edit_script(request, project_id):
                     original_text=form.cleaned_data['text'],
                     generated_by_ai=False
                 )
-            return redirect('process_script', project_id=project.id)
+            return redirect('videos:rocess_script', project_id=project.id)
     else:
         initial = {'text': script.original_text if script else ''}
         form = ScriptForm(initial=initial)
@@ -183,7 +183,7 @@ def find_media(request, project_id):
         except Exception as e:
             print(f"Error downloading media: {e}")
 
-    return redirect('generate_voiceovers', project_id=project.id)
+    return redirect('videos:generate_voiceovers', project_id=project.id)
 
 
 @login_required
@@ -213,60 +213,86 @@ def generate_voiceovers(request, project_id):
         # Clean up
         os.unlink(audio_file)
 
-    return redirect('render_video', project_id=project.id)
+    return redirect('videos:render_video', project_id=project.id)
 
 
 @login_required
 def render_video(request, project_id):
-    project = get_object_or_404(VideoProject, id=project_id, user=request.user)
-    script = get_object_or_404(VideoScript, project=project)
-    scenes = script.scenes.all().order_by('order')
-
-    # Prepare scene data for video editor
-    scenes_data = []
-    for scene in scenes:
-        media_asset = scene.media_assets.first()
-        audio_asset = scene.audio_asset
-
-        if not media_asset or not audio_asset:
-            continue
-
-        scenes_data.append({
-            'media_path': media_asset.file.path,
-            'media_type': media_asset.asset_type,
-            'media_duration': media_asset.duration_seconds,
-            'audio_path': audio_asset.file.path,
-            'scene_text': scene.text
-        })
-
-    # Generate output path
-    output_filename = f'rendered_{project.id}.mp4'
-    output_path = os.path.join(settings.MEDIA_ROOT, 'rendered_videos', output_filename)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    # Render video
-    editor = VideoEditor()
-    success = editor.combine_scenes(scenes_data, output_path)
-
-    if success:
-        # Save rendered video
-        rendered_video = RenderedVideo.objects.create(
-            project=project,
-            file=f'rendered_videos/{output_filename}',
-            duration_seconds=sum(s['media_duration'] for s in scenes_data),
-            resolution='1920x1080'
+    """View for rendering the video"""
+    try:
+        project = VideoProject.objects.get(id=project_id, user=request.user)
+        script = get_object_or_404(VideoScript, project=project)
+        
+        # Update project status to processing
+        project.status = 'processing'
+        project.save()
+        
+        # Get all scenes for this project
+        scenes_data = []
+        scenes = Scene.objects.filter(script=script).order_by('order')
+        
+        for scene in scenes:
+            media_asset = scene.media_assets.first()
+            audio_asset = getattr(scene, 'audio_asset', None)
+            
+            if media_asset and audio_asset:
+                # Ensure file paths exist
+                if not os.path.exists(media_asset.file.path):
+                    messages.error(request, f"Media file not found: {media_asset.file.name}")
+                    return redirect('videos:view_project', project_id=project.id)
+                    
+                if not os.path.exists(audio_asset.file.path):
+                    messages.error(request, f"Audio file not found: {audio_asset.file.name}")
+                    return redirect('videos:view_project', project_id=project.id)
+                
+                scenes_data.append({
+                    'media_path': media_asset.file.path,
+                    'audio_path': audio_asset.file.path,
+                    'text': scene.text
+                })
+        
+        if not scenes_data:
+            messages.error(request, "No scenes found with both media and audio")
+            project.status = 'failed'
+            project.save()
+            return redirect('videos:view_project', project_id=project.id)
+        
+        # Create the output filename
+        output_filename = f"project_{project_id}_final.mp4"
+        
+        # Render the video - no need to manually create output directories anymore
+        # The updated VideoEditor will handle this and create the RenderedVideo model entry
+        success, media_url = VideoEditor.combine_scenes(
+            scenes_data=scenes_data, 
+            output_path=output_filename,
+            project_id=project_id
         )
-
-        # Update project status
-        project.status = 'completed'
-        project.save()
-
-        return redirect('view_project', project_id=project.id)
-    else:
-        project.status = 'failed'
-        project.save()
-        return render(request, 'videos/render_error.html', {'project': project})
-
+        
+        if success:
+            messages.success(request, "Video rendered successfully!")
+        else:
+            messages.error(request, "Error rendering video. Check logs for details.")
+            # Project status will already be updated by the VideoEditor
+            
+        return redirect('videos:view_project', project_id=project.id)
+    
+    except VideoProject.DoesNotExist:
+        messages.error(request, "Project not found")
+        return redirect('videos:project_list')
+    except Exception as e:
+        import traceback
+        print(f"Error rendering video: {str(e)}")
+        print(traceback.format_exc())
+        
+        # Update project status to failed
+        try:
+            project.status = 'failed'
+            project.save()
+        except:
+            pass  # If we can't update the project status, continue with the error response
+            
+        messages.error(request, f"Error: {str(e)}")
+        return redirect('videos:view_project', project_id=project.id)
 
 @login_required
 def view_project(request, project_id):

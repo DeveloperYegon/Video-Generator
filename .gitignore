@@ -1,2 +1,6 @@
 .env
 /db.sqlite3
+/media
+.idea
+/config/nltk_data
+/nltk_data
