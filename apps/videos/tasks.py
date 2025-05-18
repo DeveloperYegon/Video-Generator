@@ -1,3 +1,4 @@
+# apps/videos/tasks.py
 from config.celery import shared_task
 from .services import ScriptProcessor, MediaFinder, VoiceGenerator,VideoEditor
 from django.core.mail import send_mail

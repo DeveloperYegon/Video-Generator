@@ -1,8 +1,10 @@
+# apps/videos/services.py
 import os
 import json
 import tempfile
 import subprocess
 import requests
+import tempfile
 import nltk
 import boto3
 import google.generativeai as genai
@@ -15,6 +17,9 @@ from nltk.tokenize import sent_tokenize
 from nltk.probability import FreqDist
 from nltk import BigramCollocationFinder, BigramAssocMeasures
 import string
+import stability_sdk.interfaces.gooseai.generation.generation_pb2 as generation
+from stability_sdk import client
+import logging
 
 # Configure NLTK data path
 nltk.data.path.append(os.path.join(settings.BASE_DIR, 'nltk_data'))
@@ -34,6 +39,7 @@ class ScriptGenerator:
             return response.text
         except Exception as e:
             return f"Script generation error: {str(e)}"
+
 
 class ScriptProcessor:
     @staticmethod
@@ -68,44 +74,34 @@ class ScriptProcessor:
         
         return sorted(list(set(keywords)))[:num_keywords]
 
-
-
 class MediaFinder:
     def __init__(self):
-        self.headers = {
-            "Authorization": settings.PEXELS_API_KEY
-        }
+        self.stability_api = client.StabilityInference(
+            key=settings.STABILITY_API_KEY,
+            verbose=True,
+            engine="stable-diffusion-xl-1024-v1-0"
+        )
 
-    def find_media(self, keywords, media_type='video'):
+    def generate_image(self, prompt, width=1024, height=1024, steps=30):
         try:
-            query = ' '.join(keywords)
-            base_url = "https://api.pexels.com/videos/search" if media_type == 'video' else "https://api.pexels.com/v1/search"
-            params = {"query": query, "per_page": 1}
-
-            response = requests.get(base_url, headers=self.headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-
-            if media_type == 'video' and data.get("videos"):
-                video = data["videos"][0]
-                return {
-                    "url": video.get("url"),
-                    "download_url": video["video_files"][0].get("link"),
-                    "duration": video.get("duration")
-                }
-            elif media_type == 'photo' and data.get("photos"):
-                photo = data["photos"][0]
-                return {
-                    "url": photo.get("url"),
-                    "download_url": photo["src"].get("original"),
-                    "width": photo.get("width"),
-                    "height": photo.get("height")
-                }
-
+            answers = self.stability_api.generate(
+                prompt=prompt,
+                width=width,
+                height=height,
+                steps=steps,
+                cfg_scale=8.0,
+                sampler=generation.SAMPLER_K_DPMPP_2M
+            )
+            
+            for resp in answers:
+                for artifact in resp.artifacts:
+                    if artifact.type == generation.ARTIFACT_IMAGE:
+                        return artifact.binary
             return None
         except Exception as e:
-            print(f"Pexels API Error: {str(e)}")
+            logging.error(f"Stability AI Error: {str(e)}")
             return None
+
 
 class VoiceGenerator:
     def __init__(self):
@@ -115,11 +111,60 @@ class VoiceGenerator:
             aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
         )
+        
+        # Available voices from Amazon Polly (Neural voices)
+        self.available_voices = {
+            'Matthew': 'Male (US)',
+            'Joanna': 'Female (US)',
+            'Lupe': 'Female (US, Spanish)',
+            'Ruth': 'Female (US)',
+            'Stephen': 'Male (US)',
+            'Olivia': 'Female (Australian)',
+            'Amy': 'Female (British)',
+            'Emma': 'Female (British)',
+            'Brian': 'Male (British)',
+            'Aria': 'Female (New Zealand)',
+            'Gabrielle': 'Female (French)',
+            'Vicki': 'Female (German)',
+            'Takumi': 'Male (Japanese)',
+            'Lucia': 'Female (Spanish)',
+            'Camila': 'Female (Brazilian Portuguese)'
+        }
     
-    def generate_voiceover(self, text, voice_id='Joanna'):
+    def get_available_voices(self):
+        """Returns a dictionary of available voices and their descriptions"""
+        return self.available_voices
+    
+    def clean_narration_text(self, text):
+        """
+        Clean the text to remove scene descriptions (text in brackets or parentheses)
+        and any other non-narration elements
+        """
+        import re
+        
+        # Remove text between brackets [...] or parentheses (...)
+        cleaned_text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
+        
+        # Remove any "Scene:" or "Description:" prefixes
+        cleaned_text = re.sub(r'(?i)^(scene|description):\s*', '', cleaned_text)
+        
+        # Clean up multiple spaces and line breaks
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+        
+        return cleaned_text
+    
+    def generate_voiceover(self, text, voice_id='Matthew'):
+        """Generate voiceover with specified voice ID"""
         try:
+            # Clean the text to remove scene descriptions
+            narration_text = self.clean_narration_text(text)
+            
+            # Skip empty text after cleaning
+            if not narration_text.strip():
+                return None
+                
             response = self.client.synthesize_speech(
-                Text=text,
+                Text=narration_text,
                 OutputFormat='mp3',
                 VoiceId=voice_id,
                 Engine='neural'
@@ -135,98 +180,54 @@ class VoiceGenerator:
 class VideoEditor:
     @staticmethod
     def combine_scenes(scenes_data, output_path, project_id=None):
-        """
-        Combine multiple video and audio scenes into a single video
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        Args:
-            scenes_data: List of dictionaries with media_path and audio_path keys
-            output_path: Path where the rendered video should be saved
-            project_id: Optional VideoProject ID for organizing output
-        
-        Returns:
-            Tuple of (success, output_file_path)
-        """
-        # Ensure we're using the media folder from Django settings
-        if project_id:
-            # Create project-specific subdirectory in media folder
-            output_dir = os.path.join(settings.MEDIA_ROOT, 'rendered_videos', f'project_{project_id}')
-        else:
-            output_dir = os.path.join(settings.MEDIA_ROOT, 'rendered_videos')
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # If output_path is just a filename, append it to the output_dir
-        if os.path.dirname(output_path) == '':
-            output_path = os.path.join(output_dir, output_path)
-        else:
-            # Ensure the directory exists
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # Get absolute path for output
-        output_path = os.path.abspath(output_path)
-        
-        # Standardize parameters
-        TARGET_RESOLUTION = '1920x1080'
-        TARGET_FRAMERATE = 30
-        TARGET_AUDIO_SAMPLE_RATE = 44100
-        TARGET_PIXEL_FORMAT = 'yuv420p'
-        
-        # Create temporary file for filter complex script
-        filter_complex = []
-        
-        # Build input file arguments
-        input_args = []
-        for i, scene in enumerate(scenes_data):
-            # Check if files exist
-            if not os.path.exists(scene['media_path']):
-                print(f"Media file not found: {scene['media_path']}")
-                return False, None
-            if not os.path.exists(scene['audio_path']):
-                print(f"Audio file not found: {scene['audio_path']}")
-                return False, None
-                
-            # Add files to input args
-            input_args.extend(['-i', scene['media_path']])
-            input_args.extend(['-i', scene['audio_path']])
-        
-        # Process each input pair (video, audio)
+        inputs = []
+        filter_chains = []
         video_streams = []
         audio_streams = []
         
-        for i in range(len(scenes_data)):
-            # Video input is at index 2*i, audio input at 2*i+1
-            video_idx = 2*i
-            audio_idx = 2*i+1
-            
-            # Video processing with detailed error handling
-            video_streams.append(f"v{i}")
-            filter_complex.append(
-                f"[{video_idx}:v:0]scale={TARGET_RESOLUTION.split('x')[0]}:{TARGET_RESOLUTION.split('x')[1]}:force_original_aspect_ratio=decrease,"
-                f"pad={TARGET_RESOLUTION.split('x')[0]}:{TARGET_RESOLUTION.split('x')[1]}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                f"fps={TARGET_FRAMERATE},format={TARGET_PIXEL_FORMAT}[v{i}]"
-            )
-            
-            # Audio processing with robust handling
-            audio_streams.append(f"a{i}")
-            filter_complex.append(
-                f"[{audio_idx}:a:0]aformat=sample_rates={TARGET_AUDIO_SAMPLE_RATE}:"
-                f"channel_layouts=stereo,volume=1.0,aresample={TARGET_AUDIO_SAMPLE_RATE}:async=1000[a{i}]"
-            )
+        # Standardization parameters
+        TARGET_RESOLUTION = '1920x1080'
+        TARGET_FRAMERATE = 30
+        TARGET_AUDIO_SAMPLE_RATE = 44100
         
-        # Build concatenation filter
-        video_inputs = ''.join(f"[{v}]" for v in video_streams)
-        audio_inputs = ''.join(f"[{a}]" for a in audio_streams)
+        for index, scene in enumerate(scenes_data):
+            # Add inputs
+            inputs.extend(['-i', scene['media_path']])
+            inputs.extend(['-i', scene['audio_path']])
+            
+            # Video processing chain
+            video_filter = [
+                f"[{index*2}:v]scale={TARGET_RESOLUTION}[v{index}_scaled];",
+                f"v{index}_scaled,fps={TARGET_FRAMERATE}[v{index}_fps];",
+                f"v{index}_fps,setpts=PTS-STARTPTS[v{index}]"
+            ]
+            
+            # Audio processing chain
+            audio_filter = [
+                f"[{index*2+1}:a]aformat=sample_rates={TARGET_AUDIO_SAMPLE_RATE}:channel_layouts=stereo,",
+                "aresample=async=1,",
+                "asetpts=PTS-STARTPTS,",
+                f"arealtime[a{index}]"
+            ]
+            
+            filter_chains.extend(video_filter)
+            filter_chains.extend(audio_filter)
+            
+            video_streams.append(f"[v{index}]")
+            audio_streams.append(f"[a{index}]")
         
-        filter_complex.append(
-            f"{video_inputs}concat=n={len(scenes_data)}:v=1:a=0[outv];"
-            f"{audio_inputs}concat=n={len(scenes_data)}:v=0:a=1[outa]"
+        # Concatenation filter
+        filter_chains.append(
+            f"{''.join(video_streams)}concat=n={len(scenes_data)}:v=1:a=0[outv];"
+            f"{''.join(audio_streams)}concat=n={len(scenes_data)}:v=0:a=1[outa]"
         )
         
-        # Build final ffmpeg command
         cmd = [
             'ffmpeg', '-y',
-            *input_args,
-            '-filter_complex', ';'.join(filter_complex),
+            *inputs,
+            '-filter_complex', ''.join(filter_chains),
             '-map', '[outv]',
             '-map', '[outa]',
             '-c:v', 'libx264',
@@ -234,101 +235,50 @@ class VideoEditor:
             '-crf', '23',
             '-c:a', 'aac',
             '-b:a', '192k',
-            '-shortest',
             '-movflags', '+faststart',
             output_path
         ]
         
         try:
-            print(f"Running FFmpeg command: {' '.join(cmd)}")
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print(f"FFmpeg output: {result.stdout}")
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
             
-            # Verify the output file was created
-            if os.path.exists(output_path):
-                print(f"Successfully created video at: {output_path}")
-                # Save to Django's RenderedVideo model
-                relative_path = VideoEditor.get_relative_media_path(output_path)
-                
-                # Create RenderedVideo entry if project_id is provided
-                if project_id:
-                    try:
-                        from apps.videos.models import VideoProject, RenderedVideo
-                        
-                        # Get video information for duration and resolution
-                        video_info = VideoEditor.verify_media_file(output_path)
-                        
-                        # Extract duration and resolution
-                        duration = 0
-                        resolution = TARGET_RESOLUTION  # Default
-                        
-                        if video_info and 'streams' in video_info:
-                            for stream in video_info['streams']:
-                                if stream.get('codec_type') == 'video':
-                                    # Calculate duration
-                                    if 'duration' in stream:
-                                        duration = float(stream['duration'])
-                                    # Get resolution
-                                    width = stream.get('width', 0)
-                                    height = stream.get('height', 0)
-                                    if width and height:
-                                        resolution = f"{width}x{height}"
-                                    break
-                        
-                        # Get or create the rendered video associated with this project
-                        project = VideoProject.objects.get(id=project_id)
-                        
-                        # Delete existing rendered video if it exists
-                        RenderedVideo.objects.filter(project=project).delete()
-                        
-                        # Create new rendered video
-                        rendered_video = RenderedVideo.objects.create(
-                            project=project,
-                            file=relative_path,
-                            duration_seconds=duration,
-                            resolution=resolution
-                        )
-                        
-                        # Update project status
-                        project.status = 'completed'
-                        project.save()
-                        
-                        print(f"Created RenderedVideo entry for project {project_id}")
-                        
-                    except Exception as e:
-                        print(f"Error saving rendered video to database: {str(e)}")
-                        # Continue anyway since the file was created successfully
-                
-                return True, relative_path
-            else:
-                print(f"Error: Output file not created at {output_path}")
-                
-                # Update project status if project_id was provided
-                if project_id:
-                    try:
-                        from apps.videos.models import VideoProject
-                        project = VideoProject.objects.get(id=project_id)
-                        project.status = 'failed'
-                        project.save()
-                    except Exception as e:
-                        print(f"Error updating project status: {str(e)}")
-                
-                return False, None
-                
-        except subprocess.CalledProcessError as e:
-            print(f"FFmpeg error: {e.stderr}")
-            
-            # Update project status if project_id was provided
             if project_id:
-                try:
-                    from apps.videos.models import VideoProject
-                    project = VideoProject.objects.get(id=project_id)
-                    project.status = 'failed'
-                    project.save()
-                except Exception as db_error:
-                    print(f"Error updating project status: {str(db_error)}")
+                # Use process_single_video to handle DB updates
+                final_output = os.path.join(
+                    settings.MEDIA_ROOT,
+                    'rendered_videos',
+                    f'project_{project_id}',
+                    os.path.basename(output_path))
+                
+                success, media_url = VideoEditor.process_single_video(
+                    output_path,
+                    final_output,
+                    project_id
+                )
+                return success, media_url
+                
+            return True, output_path
             
+        except subprocess.CalledProcessError as e:
+            if project_id:
+                VideoEditor._update_project_status(project_id, 'failed')
             return False, None
+
+    @staticmethod
+    def _update_project_status(project_id, status):
+        try:
+            from apps.videos.models import VideoProject
+            project = VideoProject.objects.get(id=project_id)
+            project.status = status
+            project.save()
+        except Exception as e:
+            print(f"Status update error: {str(e)}")
     
     @staticmethod
     def get_relative_media_path(absolute_path):

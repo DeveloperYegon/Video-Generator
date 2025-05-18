@@ -1,3 +1,4 @@
+<!-- apps/videos/templates/videos/edit_script.html -->
 {% extends "core/base.html" %}
 
 {% block title %}Edit Script - {{ project.title }}{% endblock %}
@@ -11,13 +12,14 @@ document.addEventListener('DOMContentLoaded', function() {
             e.preventDefault();
             const topic = prompt('Enter a topic for AI generation:');
             if (topic) {
+                const voiceId = document.getElementById('id_voice_id').value;
                 fetch(`{% url 'videos:generate_script' project.id %}`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/x-www-form-urlencoded',
                         'X-CSRFToken': '{{ csrf_token }}'
                     },
-                    body: `topic=${encodeURIComponent(topic)}&length=300`
+                    body: `topic=${encodeURIComponent(topic)}&length=300&voice_id=${encodeURIComponent(voiceId)}`
                 })
                 .then(response => response.json())
                 .then(data => {
@@ -56,12 +58,29 @@ document.addEventListener('DOMContentLoaded', function() {
                         {{ form.text.errors }}
                     </div>
                 {% endif %}
+                <small class="form-text text-muted">
+                    Write your script. Text in parentheses (like this) or brackets [like this] will be considered scene descriptions and won't be read aloud.
+                </small>
             </div>
+            
+            <div class="mb-3">
+                {{ form.voice_id.label_tag }}
+                {{ form.voice_id }}
+                {% if form.voice_id.errors %}
+                    <div class="invalid-feedback d-block">
+                        {{ form.voice_id.errors }}
+                    </div>
+                {% endif %}
+                <small class="form-text text-muted">
+                    Select the voice for your narration
+                </small>
+            </div>
+            
             <div class="d-grid gap-2 d-md-flex justify-content-md-end">
                 <button type="submit" class="btn btn-primary">Save Script</button>
-                <a href="{% url 'videos:process_script' project.id %}" class="btn btn-success">
-                    Process Script
-                </a>
+                <button type="submit" name="process_script" class="btn btn-success">
+                    Save & Process Script
+                </button>
             </div>
         </form>
     </div>

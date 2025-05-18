@@ -25,11 +25,11 @@ class VideoScript(models.Model):
     project = models.OneToOneField(VideoProject, on_delete=models.CASCADE, related_name='script')
     original_text = models.TextField()
     generated_by_ai = models.BooleanField(default=False)
+    voice_id = models.CharField(max_length=50, default='Matthew')  # Default voice ID
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"Script for {self.project.title}"
-
 
 class Scene(models.Model):
     script = models.ForeignKey(VideoScript, on_delete=models.CASCADE, related_name='scenes')
@@ -46,16 +46,14 @@ class Scene(models.Model):
 
 class MediaAsset(models.Model):
     scene = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='media_assets')
-    asset_type = models.CharField(max_length=10, choices=[('image', 'Image'), ('video', 'Video')])
-    source = models.CharField(max_length=20, default='pexels',
-                              choices=[('pexels', 'Pexels'), ('upload', 'Uploaded')])
-    url = models.URLField(blank=True)
-    file = models.FileField(upload_to='media_assets/', blank=True, null=True,
-                            validators=[FileExtensionValidator(allowed_extensions=['jpg', 'jpeg', 'png', 'mp4'])])
+    asset_type = models.CharField(max_length=10, default='image', choices=[('image', 'Image')])
+    source = models.CharField(max_length=20, default='stability-ai')
+    file = models.FileField(upload_to='media_assets/', blank=True, null=True)
+    generated_prompt = models.TextField(default='Placeholder')  # Store the prompt used for generation
     duration_seconds = models.FloatField(default=5.0)
-
+    
     def __str__(self):
-        return f"{self.get_asset_type_display()} for {self.scene}"
+        return f"Generated image for {self.scene}"
 
 
 class AudioAsset(models.Model):

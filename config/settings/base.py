@@ -158,3 +158,6 @@ nltk.data.path.append(NLTK_DATA_PATH)
 STATIC_URL = 'static/'
 STATICFILES_DIRS = [os.path.join(BASE_DIR, '..', 'static')]
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+STABILITY_API_KEY = os.getenv('STABILITY_API_KEY')  # Get from Stability AI platform
+MEDIA_GENERATION_STYLE = "cinematic"  # Options: cinematic, photography, anime, etc.

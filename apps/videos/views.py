@@ -1,10 +1,10 @@
-
-#/apps/videos/views.py
+# apps/videos/views.py
 from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib import messages 
 from django.contrib.auth.decorators import login_required
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponseRedirect
 from django.views.decorators.csrf import csrf_exempt
+from django.urls import reverse
 from .models import VideoProject, VideoScript, Scene, MediaAsset, AudioAsset, RenderedVideo
 from .services import ScriptGenerator, ScriptProcessor, MediaFinder, VoiceGenerator, VideoEditor
 from .forms import VideoProjectForm, ScriptForm
@@ -12,7 +12,7 @@ import os
 import requests
 from django.conf import settings
 from django.core.files import File
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, mkstemp
 import uuid
 
 
@@ -33,28 +33,46 @@ def create_project(request):
 @login_required
 def edit_script(request, project_id):
     project = get_object_or_404(VideoProject, id=project_id, user=request.user)
+    voice_gen = VoiceGenerator()
+    voice_choices = [(voice_id, f"{voice_id} - {description}") for voice_id, description in voice_gen.get_available_voices().items()]
 
     try:
         script = project.script
+        voice_id = script.voice_id
     except VideoScript.DoesNotExist:
         script = None
+        voice_id = 'Matthew'  # Default voice
 
     if request.method == 'POST':
-        form = ScriptForm(request.POST)
+        form = ScriptForm(request.POST, voice_choices=voice_choices)
         if form.is_valid():
+            text = form.cleaned_data['text']
+            selected_voice_id = form.cleaned_data['voice_id']
+            
             if script:
-                script.original_text = form.cleaned_data['text']
+                script.original_text = text
+                script.voice_id = selected_voice_id
                 script.save()
             else:
                 script = VideoScript.objects.create(
                     project=project,
-                    original_text=form.cleaned_data['text'],
+                    original_text=text,
+                    voice_id=selected_voice_id,
                     generated_by_ai=False
                 )
-            return redirect('videos:rocess_script', project_id=project.id)
+            
+            messages.success(request, "Script saved successfully.")
+            
+            # Check if the user clicked the Process button
+            if 'process_script' in request.POST:
+                return redirect('videos:process_script', project_id=project.id)
+            return redirect('videos:edit_script', project_id=project.id)
     else:
-        initial = {'text': script.original_text if script else ''}
-        form = ScriptForm(initial=initial)
+        initial = {
+            'text': script.original_text if script else '',
+            'voice_id': voice_id
+        }
+        form = ScriptForm(initial=initial, voice_choices=voice_choices)
 
     return render(request, 'videos/edit_script.html', {
         'project': project,
@@ -70,6 +88,7 @@ def generate_script(request, project_id):
     if request.method == 'POST':
         topic = request.POST.get('topic', '')
         length = request.POST.get('length', 300)
+        voice_id = request.POST.get('voice_id', 'Matthew')
 
         generator = ScriptGenerator()
         generated_text = generator.generate_script(topic, length)
@@ -78,12 +97,14 @@ def generate_script(request, project_id):
         try:
             script = project.script
             script.original_text = generated_text
+            script.voice_id = voice_id
             script.generated_by_ai = True
             script.save()
         except VideoScript.DoesNotExist:
             script = VideoScript.objects.create(
                 project=project,
                 original_text=generated_text,
+                voice_id=voice_id,
                 generated_by_ai=True
             )
 
@@ -120,7 +141,7 @@ def process_script(request, project_id):
         return redirect('videos:find_media', project_id=project.id)
     except Exception as e:
         messages.error(request, f"Script processing failed: {str(e)}")
-        return redirect('edit_script', project_id=project.id)
+        return redirect('videos:edit_script', project_id=project.id)
 
 
 @login_required
@@ -128,64 +149,50 @@ def find_media(request, project_id):
     project = get_object_or_404(VideoProject, id=project_id, user=request.user)
     script = get_object_or_404(VideoScript, project=project)
     scenes = script.scenes.all().order_by('order')
-
+    
     media_finder = MediaFinder()
-
+    
     for scene in scenes:
-        # Skip if media already exists
         if scene.media_assets.exists():
             continue
-
+            
         keywords = scene.keywords
-        # First try to find a video
-        media = media_finder.find_media(keywords, media_type='video')
-
-        if not media:
-            # Fall back to image if no video found
-            media = media_finder.find_media(keywords, media_type='photo')
-            if not media:
-                continue
-
-        # Download the media
+        prompt = f"High quality YouTube background footage showing {' '.join(keywords)}, cinematic, 4k, trending on artstation"
+        
         try:
-            response = requests.get(media['download_url'], stream=True)
-            if response.status_code == 200:
-                ext = 'mp4' if 'video' in media['download_url'] else 'jpg'
-                temp_file = NamedTemporaryFile(delete=False, suffix=f'.{ext}')
-
-                for chunk in response.iter_content(1024):
-                    temp_file.write(chunk)
-
-                temp_file.close()
-
-                # Create media asset
-                media_asset = MediaAsset.objects.create(
+            image_data = media_finder.generate_image(
+                prompt=prompt,
+                width=1024,
+                height=576
+            )
+            
+            if image_data:
+                media_dir = os.path.join(settings.MEDIA_ROOT, 'media_assets')
+                os.makedirs(media_dir, exist_ok=True)
+                
+                filename = f"stability_{scene.id}_{'_'.join(keywords[:3])}.png"
+                filepath = os.path.join(media_dir, filename)
+                
+                with open(filepath, 'wb') as f:
+                    f.write(image_data)
+                
+                MediaAsset.objects.update_or_create(
                     scene=scene,
-                    asset_type='video' if 'video' in media['download_url'] else 'image',
-                    source='pexels',
-                    url=media['url']
+                    defaults={
+                        'asset_type': 'image',
+                        'source': 'generated',
+                        'file': f'media_assets/{filename}',
+                        'duration_seconds': 5.0,
+                        'generated_prompt': prompt
+                    }
                 )
-
-                # Save the file
-                with open(temp_file.name, 'rb') as f:
-                    media_asset.file.save(f'{uuid.uuid4()}.{ext}', File(f))
-
-                # Set duration (5 seconds for images, actual duration for videos)
-                if media_asset.asset_type == 'image':
-                    media_asset.duration_seconds = 5.0
-                else:
-                    media_asset.duration_seconds = media.get('duration', 5.0)
-
-                media_asset.save()
-
-                # Clean up
-                os.unlink(temp_file.name)
+                
         except Exception as e:
-            print(f"Error downloading media: {e}")
-
+            print(f"Error generating media for scene {scene.id}: {str(e)}")
+            continue
+    
     return redirect('videos:generate_voiceovers', project_id=project.id)
-
-
+    
 @login_required
 def generate_voiceovers(request, project_id):
     project = get_object_or_404(VideoProject, id=project_id, user=request.user)
@@ -193,20 +200,26 @@ def generate_voiceovers(request, project_id):
     scenes = script.scenes.all().order_by('order')
 
     voice_gen = VoiceGenerator()
+    
+    # Get the selected voice ID from the script
+    voice_id = script.voice_id
+
+    # Remove existing audio assets
+    AudioAsset.objects.filter(scene__script=script).delete()
 
     for scene in scenes:
-        # Skip if audio already exists
-        if hasattr(scene, 'audio_asset'):
+        # Generate voiceover with the selected voice
+        audio_file = voice_gen.generate_voiceover(scene.text, voice_id=voice_id)
+        
+        # Skip if no audio was generated (e.g., empty text after cleaning)
+        if not audio_file:
             continue
-
-        # Generate voiceover
-        audio_file = voice_gen.generate_voiceover(scene.text)
 
         # Create audio asset
         with open(audio_file, 'rb') as f:
             audio_asset = AudioAsset.objects.create(
                 scene=scene,
-                voice_id='Joanna'  # Default voice
+                voice_id=voice_id
             )
             audio_asset.file.save(f'{uuid.uuid4()}.mp3', File(f))
 
@@ -257,24 +270,27 @@ def render_video(request, project_id):
             project.save()
             return redirect('videos:view_project', project_id=project.id)
         
-        # Create the output filename
-        output_filename = f"project_{project_id}_final.mp4"
+        # Create temporary output path
+        _, temp_output = mkstemp(suffix='.mp4')
         
-        # Render the video - no need to manually create output directories anymore
-        # The updated VideoEditor will handle this and create the RenderedVideo model entry
+        # Render the video
         success, media_url = VideoEditor.combine_scenes(
             scenes_data=scenes_data, 
-            output_path=output_filename,
+            output_path=temp_output,
             project_id=project_id
         )
         
         if success:
             messages.success(request, "Video rendered successfully!")
+            # Clean up temporary file
+            try:
+                os.remove(temp_output)
+            except OSError:
+                pass
         else:
             messages.error(request, "Error rendering video. Check logs for details.")
-            # Project status will already be updated by the VideoEditor
-            
-        return redirect('videos:view_project', project_id=project.id)
+        
+        return redirect('videos:view_project', project_id=project_id)
     
     except VideoProject.DoesNotExist:
         messages.error(request, "Project not found")
@@ -303,3 +319,38 @@ def view_project(request, project_id):
 def project_list(request):
     projects = VideoProject.objects.filter(user=request.user).order_by('-created_at')
     return render(request, 'videos/project_list.html', {'projects': projects})
+
+@login_required
+def delete_project(request, project_id):
+    project = get_object_or_404(VideoProject, id=project_id, user=request.user)
+    
+    if request.method == 'POST':
+        # Delete associated files
+        try:
+            # Delete rendered video files
+            if hasattr(project, 'rendered_video') and project.rendered_video:
+                if project.rendered_video.file and os.path.exists(project.rendered_video.file.path):
+                    os.remove(project.rendered_video.file.path)
+            
+            # Delete script-related files (media and audio)
+            if hasattr(project, 'script'):
+                for scene in project.script.scenes.all():
+                    # Delete media assets
+                    for media in scene.media_assets.all():
+                        if media.file and os.path.exists(media.file.path):
+                            os.remove(media.file.path)
+                    
+                    # Delete audio assets
+                    if hasattr(scene, 'audio_asset') and scene.audio_asset:
+                        if scene.audio_asset.file and os.path.exists(scene.audio_asset.file.path):
+                            os.remove(scene.audio_asset.file.path)
+        except Exception as e:
+            print(f"Error deleting files: {str(e)}")
+        
+        # Delete project from database
+        project.delete()
+        messages.success(request, f"Project '{project.title}' has been deleted.")
+        
+        return redirect('videos:project_list')
+    
+    return render(request, 'videos/confirm_delete.html', {'project': project})

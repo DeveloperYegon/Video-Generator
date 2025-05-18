@@ -1,3 +1,4 @@
+# apps/videos/apps.py
 from django.apps import AppConfig
 import os
 
