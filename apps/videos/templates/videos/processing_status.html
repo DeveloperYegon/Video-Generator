@@ -1,0 +1,70 @@
+{% extends 'core/base.html' %}
+
+{% block title %}{{ info.title }} - {{ project.title }}{% endblock %}
+
+{% block content %}
+<div class="container py-5">
+    <div class="card shadow">
+        <div class="card-body text-center p-5">
+            <h1 class="mb-4">{{ info.title }}</h1>
+
+            <div class="progress mb-4" style="height: 20px;">
+                <div class="progress-bar progress-bar-striped progress-bar-animated"
+                     role="progressbar"
+                     style="width: {{ info.progress }}%;"
+                     aria-valuenow="{{ info.progress }}"
+                     aria-valuemin="0"
+                     aria-valuemax="100">{{ info.progress }}%</div>
+            </div>
+
+            <p class="lead mb-5">{{ info.message }}</p>
+            <p>Please wait while we prepare your video. This process can take several minutes.</p>
+
+            <div class="d-flex justify-content-between mt-5">
+                <a href="{% url 'videos:view_project' project.id %}" class="btn btn-outline-secondary">
+                    <i class="fas fa-arrow-left"></i> Back to Project
+                </a>
+
+                <a href="{{ refresh_url }}" class="btn btn-primary">
+                    <i class="fas fa-sync-alt"></i> Check Status
+                </a>
+            </div>
+
+            <div class="mt-4">
+                <small class="text-muted">
+                    Current step: {{ info.title }} &rarr; Next: {{ info.next_step }}
+                </small>
+            </div>
+        </div>
+    </div>
+
+    <div class="card shadow mt-4">
+        <div class="card-header">
+            <h5 class="mb-0">Processing Information</h5>
+        </div>
+        <div class="card-body">
+            <p><strong>Project:</strong> {{ project.title }}</p>
+            <p><strong>Status:</strong> {{ project.get_status_display }}</p>
+            {% if project.error_message %}
+            <div class="alert alert-danger">
+                <strong>Error:</strong> {{ project.error_message }}
+            </div>
+            {% endif %}
+
+            <div class="alert alert-info">
+                <i class="fas fa-info-circle"></i>
+                <strong>Pro Tip:</strong> You can leave this page and come back later.
+                Your video will continue processing in the background.
+            </div>
+        </div>
+    </div>
+</div>
+
+{% comment %}Add automatic refresh every 15 seconds{% endcomment %}
+<script>
+    // Auto refresh the page every 15 seconds
+    setTimeout(function() {
+        window.location.href = "{{ refresh_url }}";
+    }, 15000);
+</script>
+{% endblock %}

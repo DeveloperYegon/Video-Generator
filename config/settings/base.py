@@ -5,7 +5,7 @@ import nltk
 from django.core.management.utils import get_random_secret_key
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -77,10 +77,15 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME', 'videomaker_dev'),
+        'USER': os.getenv('DB_USER', 'postgres_video_user'),
+        'PASSWORD': os.getenv('DB_PASSWORD', 'postgres_usr_pass'),
+        'HOST': os.getenv('DB_HOST', 'localhost'),  # Important!
+        'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
+
 
 
 # Password validation
@@ -156,7 +161,10 @@ os.makedirs(NLTK_DATA_PATH, exist_ok=True)
 nltk.data.path.append(NLTK_DATA_PATH)
 
 STATIC_URL = 'static/'
-STATICFILES_DIRS = [os.path.join(BASE_DIR, '..', 'static')]
+STATICFILES_DIRS = [
+    BASE_DIR / "static",
+]
+
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 STABILITY_API_KEY = os.getenv('STABILITY_API_KEY')  # Get from Stability AI platform

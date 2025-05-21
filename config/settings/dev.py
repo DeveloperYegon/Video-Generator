@@ -18,16 +18,17 @@ hostname, _, ips = socket.gethostbyname_ex(socket.gethostname())
 INTERNAL_IPS = [ip[: ip.rfind(".")] + ".1" for ip in ips] + ["127.0.0.1",'localhost', "10.0.2.2"]
 
 # Database
-#DATABASES = {
-   # 'default': {
-   #     'ENGINE': 'django.db.backends.postgresql',
-   #     'NAME': os.getenv('DB_NAME', 'videomaker_dev'),
-    ##    'USER': os.getenv('DB_USER', 'postgres'),
-    #    'PASSWORD': os.getenv('DB_PASSWORD', 'postgres'),
-    #    'HOST': os.getenv('DB_HOST', 'localhost'),
-     #   'PORT': os.getenv('DB_PORT', '5432'),
-   # }
-#}
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME'),
+        'USER': os.getenv('DB_USER'),
+        'PASSWORD': os.getenv('DB_PASSWORD'),
+        'HOST': os.getenv('DB_HOST'),
+        'PORT': os.getenv('DB_PORT'),
+    }
+}
+
 
 # Email
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'

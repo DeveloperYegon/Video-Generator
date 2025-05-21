@@ -3,18 +3,15 @@ from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib import messages 
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse, HttpResponseRedirect
-from django.views.decorators.csrf import csrf_exempt
 from django.urls import reverse
 from .models import VideoProject, VideoScript, Scene, MediaAsset, AudioAsset, RenderedVideo
-from .services import ScriptGenerator, ScriptProcessor, MediaFinder, VoiceGenerator, VideoEditor
 from .forms import VideoProjectForm, ScriptForm
+from .tasks import process_video_project, process_script_task, find_media_task, generate_voiceovers_task, render_video_task
 import os
-import requests
-from django.conf import settings
-from django.core.files import File
-from tempfile import NamedTemporaryFile, mkstemp
 import uuid
+import logging
 
+logger = logging.getLogger(__name__)
 
 @login_required
 def create_project(request):
@@ -33,6 +30,8 @@ def create_project(request):
 @login_required
 def edit_script(request, project_id):
     project = get_object_or_404(VideoProject, id=project_id, user=request.user)
+    
+    from .services import VoiceGenerator
     voice_gen = VoiceGenerator()
     voice_choices = [(voice_id, f"{voice_id} - {description}") for voice_id, description in voice_gen.get_available_voices().items()]
 
@@ -90,6 +89,7 @@ def generate_script(request, project_id):
         length = request.POST.get('length', 300)
         voice_id = request.POST.get('voice_id', 'Matthew')
 
+        from .services import ScriptGenerator
         generator = ScriptGenerator()
         generated_text = generator.generate_script(topic, length)
 
@@ -114,211 +114,213 @@ def generate_script(request, project_id):
 
 
 @login_required
+def processing_status(request, project_id, step):
+    """
+    Show processing status page with appropriate messaging based on processing step
+
+    Args:
+        step: One of 'script', 'media', 'voiceover', 'render'
+    """
+    project = get_object_or_404(VideoProject, id=project_id, user=request.user)
+
+    # If user hits refresh, check if we can proceed to next step
+    if request.GET.get('check_status') == 'true':
+        script = project.script
+
+        if step == 'script':
+            # Check if script processing is complete
+            if script.scenes.exists():
+                messages.success(request, "Script processing complete. Proceeding to media generation.")
+                return redirect('videos:find_media', project_id=project.id)
+
+        elif step == 'media':
+            # Check if media processing is complete
+            scenes = script.scenes.all()
+            media_complete = True
+
+            for scene in scenes:
+                if not scene.media_assets.exists():
+                    media_complete = False
+                    break
+
+            if media_complete and scenes.exists():
+                messages.success(request, "Media generation complete. Proceeding to voiceover generation.")
+                return redirect('videos:generate_voiceovers', project_id=project.id)
+
+        elif step == 'voiceover':
+            # Check if voiceover processing is complete
+            scenes = script.scenes.all()
+            audio_complete = True
+
+            for scene in scenes:
+                if not hasattr(scene, 'audio_asset') or not scene.audio_asset:
+                    audio_complete = False
+                    break
+
+            if audio_complete and scenes.exists():
+                messages.success(request, "Voiceover generation complete. Proceeding to video rendering.")
+                return redirect('videos:render_video', project_id=project.id)
+
+        elif step == 'render':
+            # Check if rendering is complete
+            if project.status == 'completed' and hasattr(project, 'rendered_video'):
+                messages.success(request, "Video rendering complete!")
+                return redirect('videos:view_project', project_id=project.id)
+
+    # Set info messages based on step
+    step_info = {
+        'script': {
+            'title': 'Processing Script',
+            'message': 'We\'re analyzing your script and breaking it into scenes.',
+            'next_step': 'Media Generation',
+            'progress': 25
+        },
+        'media': {
+            'title': 'Generating Media',
+            'message': 'We\'re generating visual media for each scene in your video.',
+            'next_step': 'Voiceover Generation',
+            'progress': 50
+        },
+        'voiceover': {
+            'title': 'Creating Voiceovers',
+            'message': 'We\'re generating audio voiceovers for each scene in your video.',
+            'next_step': 'Video Rendering',
+            'progress': 75
+        },
+        'render': {
+            'title': 'Rendering Video',
+            'message': 'We\'re combining all elements to create your final video.',
+            'next_step': 'Video Preview',
+            'progress': 90
+        }
+    }
+
+    context = {
+        'project': project,
+        'info': step_info.get(step, step_info['script']),
+        'step': step,
+        'refresh_url': reverse('videos:processing_status', args=[project_id, step]) + '?check_status=true'
+    }
+
+    return render(request, 'videos/processing_status.html', context)
+
+
+@ login_required
 def process_script(request, project_id):
+    """Process script into scenes using Celery task"""
     try:
         project = get_object_or_404(VideoProject, id=project_id, user=request.user)
         script = get_object_or_404(VideoScript, project=project)
 
-        # Segment script into scenes
-        processor = ScriptProcessor()
-        sentences = processor.segment_script(script.original_text)
+        # Update project status
+        project.status = 'processing'
+        project.save()
 
-        # Clear existing scenes
-        Scene.objects.filter(script=script).delete()
+        # Run just the script processing task
+        process_script_task.delay(script.id)
 
-        # Create new scenes
-        scenes = []
-        for i, sentence in enumerate(sentences):
-            keywords = processor.extract_keywords(sentence)
-            scene = Scene.objects.create(
-                script=script,
-                order=i + 1,
-                text=sentence,
-                keywords=keywords
-            )
-            scenes.append(scene)
-              
-        return redirect('videos:find_media', project_id=project.id)
+        messages.success(request, "Script processing started. Please wait for it to complete.")
+        return redirect('videos:processing_status', project_id=project.id, step='script')
     except Exception as e:
+        logger.error(f"Error starting script processing: {str(e)}")
         messages.error(request, f"Script processing failed: {str(e)}")
         return redirect('videos:edit_script', project_id=project.id)
 
 
+
 @login_required
 def find_media(request, project_id):
+    """Find media for scenes using Celery task"""
     project = get_object_or_404(VideoProject, id=project_id, user=request.user)
     script = get_object_or_404(VideoScript, project=project)
-    scenes = script.scenes.all().order_by('order')
-    
-    media_finder = MediaFinder()
-    
-    for scene in scenes:
-        if scene.media_assets.exists():
-            continue
-            
-        keywords = scene.keywords
-        prompt = f"High quality YouTube background footage showing {' '.join(keywords)}, cinematic, 4k, trending on artstation"
-        
-        try:
-            image_data = media_finder.generate_image(
-                prompt=prompt,
-                width=1024,
-                height=576
-            )
-            
-            if image_data:
-                media_dir = os.path.join(settings.MEDIA_ROOT, 'media_assets')
-                os.makedirs(media_dir, exist_ok=True)
-                
-                filename = f"stability_{scene.id}_{'_'.join(keywords[:3])}.png"
-                filepath = os.path.join(media_dir, filename)
-                
-                with open(filepath, 'wb') as f:
-                    f.write(image_data)
-                
-                MediaAsset.objects.update_or_create(
-                    scene=scene,
-                    defaults={
-                        'asset_type': 'image',
-                        'source': 'generated',
-                        'file': f'media_assets/{filename}',
-                        'duration_seconds': 5.0,
-                        'generated_prompt': prompt
-                    }
-                )
-                
-        except Exception as e:
-            print(f"Error generating media for scene {scene.id}: {str(e)}")
-            continue
-    
+
+    # Check if scenes exist
+    if not script.scenes.exists():
+        messages.warning(request, "Scenes are still being processed. Please wait a few seconds and refresh.")
+        return redirect('videos:edit_script', project_id=project.id)
+
+    # Start media finding task
+    find_media_task.delay(script.id)
+
+    messages.success(request, "Media generation started. Please continue to the next step.")
     return redirect('videos:generate_voiceovers', project_id=project.id)
-    
+
+
 @login_required
 def generate_voiceovers(request, project_id):
+    """Generate voiceovers using Celery task"""
     project = get_object_or_404(VideoProject, id=project_id, user=request.user)
     script = get_object_or_404(VideoScript, project=project)
-    scenes = script.scenes.all().order_by('order')
-
-    voice_gen = VoiceGenerator()
     
-    # Get the selected voice ID from the script
-    voice_id = script.voice_id
-
-    # Remove existing audio assets
-    AudioAsset.objects.filter(scene__script=script).delete()
-
-    for scene in scenes:
-        # Generate voiceover with the selected voice
-        audio_file = voice_gen.generate_voiceover(scene.text, voice_id=voice_id)
-        
-        # Skip if no audio was generated (e.g., empty text after cleaning)
-        if not audio_file:
-            continue
-
-        # Create audio asset
-        with open(audio_file, 'rb') as f:
-            audio_asset = AudioAsset.objects.create(
-                scene=scene,
-                voice_id=voice_id
-            )
-            audio_asset.file.save(f'{uuid.uuid4()}.mp3', File(f))
-
-        # Clean up
-        os.unlink(audio_file)
-
+    # Check if scenes exist
+    if not script.scenes.exists():
+        messages.warning(request, "No scenes found. Processing script first...")
+        return redirect('videos:process_script', project_id=project.id)
+    
+    # Start voiceover generation task
+    generate_voiceovers_task.delay(script.id)
+    
+    messages.success(request, "Voiceover generation started. Please continue to the final step.")
     return redirect('videos:render_video', project_id=project.id)
 
 
 @login_required
 def render_video(request, project_id):
-    """View for rendering the video"""
+    """Render video using Celery task"""
     try:
         project = VideoProject.objects.get(id=project_id, user=request.user)
-        script = get_object_or_404(VideoScript, project=project)
         
         # Update project status to processing
         project.status = 'processing'
         project.save()
         
-        # Get all scenes for this project
-        scenes_data = []
-        scenes = Scene.objects.filter(script=script).order_by('order')
+        # Start the rendering task
+        render_video_task.delay(project_id)
         
-        for scene in scenes:
-            media_asset = scene.media_assets.first()
-            audio_asset = getattr(scene, 'audio_asset', None)
-            
-            if media_asset and audio_asset:
-                # Ensure file paths exist
-                if not os.path.exists(media_asset.file.path):
-                    messages.error(request, f"Media file not found: {media_asset.file.name}")
-                    return redirect('videos:view_project', project_id=project.id)
-                    
-                if not os.path.exists(audio_asset.file.path):
-                    messages.error(request, f"Audio file not found: {audio_asset.file.name}")
-                    return redirect('videos:view_project', project_id=project.id)
-                
-                scenes_data.append({
-                    'media_path': media_asset.file.path,
-                    'audio_path': audio_asset.file.path,
-                    'text': scene.text
-                })
-        
-        if not scenes_data:
-            messages.error(request, "No scenes found with both media and audio")
-            project.status = 'failed'
-            project.save()
-            return redirect('videos:view_project', project_id=project.id)
-        
-        # Create temporary output path
-        _, temp_output = mkstemp(suffix='.mp4')
-        
-        # Render the video
-        success, media_url = VideoEditor.combine_scenes(
-            scenes_data=scenes_data, 
-            output_path=temp_output,
-            project_id=project_id
-        )
-        
-        if success:
-            messages.success(request, "Video rendered successfully!")
-            # Clean up temporary file
-            try:
-                os.remove(temp_output)
-            except OSError:
-                pass
-        else:
-            messages.error(request, "Error rendering video. Check logs for details.")
-        
+        messages.success(request, "Video rendering started. You will be notified when it's complete.")
         return redirect('videos:view_project', project_id=project_id)
     
     except VideoProject.DoesNotExist:
         messages.error(request, "Project not found")
         return redirect('videos:project_list')
     except Exception as e:
-        import traceback
-        print(f"Error rendering video: {str(e)}")
-        print(traceback.format_exc())
-        
-        # Update project status to failed
-        try:
-            project.status = 'failed'
-            project.save()
-        except:
-            pass  # If we can't update the project status, continue with the error response
-            
+        logger.error(f"Error starting video rendering: {str(e)}")
         messages.error(request, f"Error: {str(e)}")
         return redirect('videos:view_project', project_id=project.id)
+
+
+@login_required
+def process_full_video(request, project_id):
+    """Process the entire video project in one go using Celery"""
+    project = get_object_or_404(VideoProject, id=project_id, user=request.user)
+    
+    # Check if script exists
+    if not hasattr(project, 'script'):
+        messages.error(request, "Please create a script first")
+        return redirect('videos:edit_script', project_id=project.id)
+    
+    # Start the full video processing task
+    process_video_project.delay(project_id)
+    
+    # Update project status
+    project.status = 'queued'
+    project.save()
+    
+    messages.success(request, "Video processing started. You'll be notified when it's complete.")
+    return redirect('videos:view_project', project_id=project.id)
+
 
 @login_required
 def view_project(request, project_id):
     project = get_object_or_404(VideoProject, id=project_id, user=request.user)
     return render(request, 'videos/view_project.html', {'project': project})
 
+
 @login_required
 def project_list(request):
     projects = VideoProject.objects.filter(user=request.user).order_by('-created_at')
     return render(request, 'videos/project_list.html', {'projects': projects})
+
 
 @login_required
 def delete_project(request, project_id):
@@ -345,7 +347,7 @@ def delete_project(request, project_id):
                         if scene.audio_asset.file and os.path.exists(scene.audio_asset.file.path):
                             os.remove(scene.audio_asset.file.path)
         except Exception as e:
-            print(f"Error deleting files: {str(e)}")
+            logger.error(f"Error deleting files: {str(e)}")
         
         # Delete project from database
         project.delete()
@@ -354,3 +356,24 @@ def delete_project(request, project_id):
         return redirect('videos:project_list')
     
     return render(request, 'videos/confirm_delete.html', {'project': project})
+
+
+@login_required
+def retry_rendering(request, project_id):
+    """Retry rendering a failed video"""
+    project = get_object_or_404(VideoProject, id=project_id, user=request.user)
+    
+    if project.status != 'failed':
+        messages.warning(request, "Only failed projects can be retried")
+        return redirect('videos:view_project', project_id=project_id)
+    
+    # Reset status and start rendering
+    project.status = 'queued'
+    project.error_message = ''
+    project.save()
+    
+    # Start the rendering task
+    render_video_task.delay(project_id)
+    
+    messages.success(request, "Video rendering restarted. You will be notified when it's complete.")
+    return redirect('videos:view_project', project_id=project_id)

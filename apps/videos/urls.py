@@ -14,5 +14,6 @@ urlpatterns = [
     path('<int:project_id>/render-video/', views.render_video, name='render_video'),
     path('<int:project_id>/generate-script/', views.generate_script, name='generate_script'),
     path('<int:project_id>/delete/', views.delete_project, name='delete_project'),
+    path('<int:project_id>/processing/<str:step>/', views.processing_status, name='processing_status'),
     path('', views.project_list, name='project_list'),
 ]
