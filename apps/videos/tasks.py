@@ -238,203 +238,129 @@ def generate_voiceovers_task(script_id):
         logger.error(f"Error generating voiceovers for script {script_id}: {str(e)}")
         logger.error(traceback.format_exc())
         raise
-@shared_task(bind=True, max_retries=3, autoretry_for=(Exception,), retry_backoff=True)
+#@shared_task(bind=True, max_retries=3, autoretry_for=(Exception,), retry_backoff=True)
+@shared_task(bind=True, max_retries=3)
 def render_video_task(self, project_id):
-    lock_name = f"render_video_task:project_{project_id}"
+    from .models import VideoProject, Scene, MediaAsset
+    from .services import VideoEditor
+    import logging
+    import os
+    from django.core.mail import send_mail
+    from django.conf import settings
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting video rendering for project {project_id}")
+
     try:
-        with redis_lock(lock_name):
-            logger.info(f"Starting video rendering for project {project_id}")
-            project = VideoProject.objects.get(id=project_id)
+        project = VideoProject.objects.get(id=project_id)
+    except VideoProject.DoesNotExist:
+        logger.error(f"VideoProject with id {project_id} does not exist")
+        return False
 
-            # Update project status
-            project.status = 'processing'
-            project.error_message = ''  # Clear previous errors
-            project.save()
+    scenes = Scene.objects.filter(script__project=project).order_by('order')
+    logger.info(f"Found {len(scenes)} scenes for project {project_id}")
 
-            script = project.script
+    scenes_data = []
+    scenes_missing_media = []
 
-            # Get all scenes for this project
-            scenes_data = []
-            scenes = Scene.objects.filter(script=script).order_by('order')
-            scene_count = scenes.count()
+    for scene in scenes:
+        media_asset = scene.media_assets.first()
+        audio_asset = scene.audio_asset if hasattr(scene, 'audio_asset') else None
 
-            logger.info(f"Found {scene_count} scenes for project {project_id}")
+        if not media_asset or not os.path.exists(media_asset.file.path):
+            scenes_missing_media.append(scene.order)
+            continue
 
-            if scene_count == 0:
-                raise Exception("No scenes found for the project")
+        if not audio_asset or not os.path.exists(audio_asset.file.path):
+            scenes_missing_media.append(scene.order)
+            continue
 
-            # Track missing assets for better error reporting
-            scenes_missing_media = []
-            scenes_missing_audio = []
-            scenes_invalid_media = []
-            scenes_invalid_audio = []
+        media_info = VideoEditor.verify_media_file(media_asset.file.path)
+        if not media_info:
+            logger.warning(f"Invalid media file for scene {scene.order}: {media_asset.file.name}")
+            scenes_missing_media.append(scene.order)
+            continue
 
-            for scene in scenes:
-                media_asset = scene.media_assets.first()
-                audio_asset = scene.audio_asset if hasattr(scene, 'audio_asset') else None
+        audio_info = VideoEditor.verify_media_file(audio_asset.file.path)
+        if not audio_info:
+            logger.warning(f"Invalid audio file for scene {scene.order}: {audio_asset.file.name}")
+            scenes_missing_media.append(scene.order)
+            continue
 
-                # Check if media asset exists
-                if not media_asset:
-                    scenes_missing_media.append(scene.order)
-                    continue
+        scenes_data.append({
+            'media_path': media_asset.file.path,
+            'audio_path': audio_asset.file.path,
+            'text': scene.text,
+            'duration_seconds': media_asset.duration_seconds
+        })
 
-                # Check if audio asset exists
-                if not audio_asset:
-                    scenes_missing_audio.append(scene.order)
-                    continue
-
-                # Ensure file paths exist on disk
-                if not os.path.exists(media_asset.file.path):
-                    logger.error(f"Media file not found: {media_asset.file.name}")
-                    scenes_missing_media.append(scene.order)
-                    continue
-
-                if not os.path.exists(audio_asset.file.path):
-                    logger.error(f"Audio file not found: {audio_asset.file.name}")
-                    scenes_missing_audio.append(scene.order)
-                    continue
-
-                # Verify file integrity using ffprobe
-                media_info = VideoEditor.verify_media_file(media_asset.file.path)
-                if not media_info:
-                    logger.error(f"Invalid media file for scene {scene.order}: {media_asset.file.name}")
-                    scenes_invalid_media.append(scene.order)
-                    continue
-
-                audio_info = VideoEditor.verify_media_file(audio_asset.file.path)
-                if not audio_info:
-                    logger.error(f"Invalid audio file for scene {scene.order}: {audio_asset.file.name}")
-                    scenes_invalid_audio.append(scene.order)
-                    continue
-
-                # Add scene to rendering list
-                scenes_data.append({
-                    'media_path': media_asset.file.path,
-                    'audio_path': audio_asset.file.path,
-                    'text': scene.text,
-                    'duration_seconds': media_asset.duration_seconds
-                })
-
-            # Report on missing assets
-            if scenes_missing_media or scenes_missing_audio or scenes_invalid_media or scenes_invalid_audio:
-                error_details = []
-
-                if scenes_missing_media:
-                    error_details.append(f"Missing media for scenes: {scenes_missing_media}")
-                if scenes_missing_audio:
-                    error_details.append(f"Missing audio for scenes: {scenes_missing_audio}")
-                if scenes_invalid_media:
-                    error_details.append(f"Invalid media files for scenes: {scenes_invalid_media}")
-                if scenes_invalid_audio:
-                    error_details.append(f"Invalid audio files for scenes: {scenes_invalid_audio}")
-
-                if not scenes_data:
-                    # Critical failure - can't render anything
-                    error_message = f"Cannot render video: {'; '.join(error_details)}"
-                    logger.error(error_message)
-
-                    # Try to regenerate missing assets if applicable
-                    if scenes_missing_media:
-                        logger.info(f"Attempting to regenerate missing media assets")
-                        find_media_task.delay(script.id)
-
-                    if scenes_missing_audio:
-                        logger.info(f"Attempting to regenerate missing audio assets")
-                        generate_voiceovers_task.delay(script.id)
-
-                    # Update project status
-                    project.status = 'failed'
-                    project.error_message = error_message[:255]  # Truncate if needed
-                    project.save()
-
-                    # Retry after delay (if we have retries left)
-                    if self.request.retries < self.max_retries:
-                        logger.info(
-                            f"Scheduling retry ({self.request.retries + 1}/{self.max_retries}) for project {project_id}")
-                        raise self.retry(countdown=60 * (2 ** self.request.retries))
-                    else:
-                        return False
-                else:
-                    # Non-critical - we can render with available scenes
-                    logger.warning(
-                        f"Rendering with partial scenes: {len(scenes_data)}/{scene_count} scenes available. {'; '.join(error_details)}")
-
-            # Create output path
-            output_dir = os.path.join(settings.MEDIA_ROOT, 'rendered_videos', f'project_{project_id}')
-            os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, f'video_{project_id}.mp4')
-
-            # Log rendering attempt
-            logger.info(f"Rendering video with {len(scenes_data)} scenes for project {project_id}")
-
-            # Render the video with extended diagnostic info
-            success, media_url = VideoEditor.combine_scenes(
-                scenes_data=scenes_data,
-                output_path=output_path,
-                project_id=project_id
+    if scenes_missing_media:
+        logger.error(f"Cannot render video: Missing media for scenes: {scenes_missing_media}")
+        logger.info("Attempting to regenerate missing media assets")
+        from .tasks import find_media_task, generate_voiceovers_task
+        script = project.script
+        find_media_task.delay(script.id)
+        generate_voiceovers_task.delay(script.id)
+        project.status = 'failed'
+        project.error_message = f"Missing media for scenes: {scenes_missing_media}"
+        project.save()
+        if project.user.email:
+            send_mail(
+                'Video processing failed',
+                f'Unfortunately, your video "{project.title}" could not be processed. Error: {project.error_message}',
+                settings.DEFAULT_FROM_EMAIL,
+                [project.user.email],
+                fail_silently=True,
             )
+        raise self.retry(countdown=60 * (2 ** self.request.retries))
 
-            if not success:
-                raise Exception("Video rendering failed. Check logs for details.")
-
-            logger.info(f"Video rendered successfully for project {project_id}: {media_url}")
-
-            # Get or create rendered video object
-            RenderedVideo.objects.filter(project=project).delete()
-
-            # Calculate total duration from scenes
-            total_duration = sum(scene.get('duration_seconds', 5.0) for scene in scenes_data)
-
-            # Create rendered video record
-            RenderedVideo.objects.create(
-                project=project,
-                file=media_url,
-                duration_seconds=total_duration,
-                resolution='1920x1080'
+    if not scenes_data:
+        error_message = "No valid scenes available for rendering"
+        logger.error(error_message)
+        project.status = 'failed'
+        project.error_message = error_message
+        project.save()
+        if project.user.email:
+            send_mail(
+                'Video processing failed',
+                f'Unfortunately, your video "{project.title}" could not be processed. Error: {error_message}',
+                settings.DEFAULT_FROM_EMAIL,
+                [project.user.email],
+                fail_silently=True,
             )
+        return False
 
-            # Update project status
+    logger.info(f"Rendering video with {len(scenes_data)} scenes for project {project_id}")
+    output_path = os.path.join(settings.MEDIA_ROOT, 'rendered_videos', f'project_{project_id}', f'video_{project_id}.mp4')
+
+    try:
+        # Call the correct method: combine_videos instead of combine_scenes
+        success = VideoEditor.combine_videos(project_id, scenes_data, output_path)
+        if success:
+            media_url = os.path.join(settings.MEDIA_URL, 'rendered_videos', f'project_{project_id}', f'video_{project_id}.mp4')
             project.status = 'completed'
-            project.error_message = ''  # Clear any error messages
+            project.media_url = media_url
+            project.error_message = ''
             project.save()
-
-            # Send notification email
-            if project.user.email:
-                send_mail(
-                    'Your video is ready!',
-                    f'Your video "{project.title}" has been successfully rendered and is now available for viewing.',
-                    settings.DEFAULT_FROM_EMAIL,
-                    [project.user.email],
-                    fail_silently=True,
-                )
-
+            logger.info(f"Updated project {project_id} status to 'completed'")
             return True
+        else:
+            raise Exception("Video rendering failed. Check logs for details.")
     except Exception as e:
         logger.error(f"Error acquiring lock or rendering video for project {project_id}: {str(e)}")
-        logger.error(traceback.format_exc())
-
-        try:
-            # Update project status
-            project = VideoProject.objects.get(id=project_id)
-            project.status = 'failed'
-            project.error_message = str(e)[:255]  # Truncate if needed
-            project.save()
-
-            # Notify user of failure
-            if project.user.email:
-                send_mail(
-                    'Video processing failed',
-                    f'Unfortunately, your video "{project.title}" could not be processed. Error: {str(e)}',
-                    settings.DEFAULT_FROM_EMAIL,
-                    [project.user.email],
-                    fail_silently=True,
-                )
-        except Exception as inner_e:
-            logger.error(f"Error updating project status: {str(inner_e)}")
-
-        # Retry with exponential backoff
+        project.status = 'failed'
+        project.error_message = str(e)[:255]
+        project.save()
+        logger.info(f"Updated project {project_id} status to 'failed'")
+        if project.user.email:
+            send_mail(
+                'Video processing failed',
+                f'Unfortunately, your video "{project.title}" could not be processed. Error: {str(e)}',
+                settings.DEFAULT_FROM_EMAIL,
+                [project.user.email],
+                fail_silently=True,
+            )
         if self.request.retries < self.max_retries:
             logger.info(f"Scheduling retry ({self.request.retries + 1}/{self.max_retries}) for project {project_id}")
-            raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
-        else:
-            return False
+            raise self.retry(countdown=60 * (2 ** self.request.retries))
+        return False

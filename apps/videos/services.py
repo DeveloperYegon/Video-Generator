@@ -3,6 +3,7 @@ import os
 import json
 import tempfile
 import subprocess
+from venv import logger
 import requests
 import nltk
 import boto3
@@ -181,203 +182,100 @@ class VoiceGenerator:
 
 class VideoEditor:
     @staticmethod
-    def combine_scenes(scenes_data, output_path, project_id=None):
+    def combine_videos(project_id, scenes_data, output_path):
         """
-        Combines multiple scenes into a single video with enhanced error handling and diagnostics.
-
-        Args:
-            scenes_data: List of dictionaries containing media_path and audio_path for each scene
-            output_path: Path where the output video will be saved
-            project_id: Optional ID of the VideoProject to update status
-
-        Returns:
-            Tuple of (success: bool, media_url: str)
+        Combine multiple scenes into a single video with audio and text overlays.
+        scenes_data: List of dicts with 'media_path', 'audio_path', 'text', 'duration_seconds'
+        output_path: Path to save the rendered video
         """
-        import logging
-        logger = logging.getLogger(__name__)
-
         logger.info(f"Starting video combination for project_id={project_id}, output_path={output_path}")
         logger.info(f"Number of scenes to process: {len(scenes_data)}")
 
-        # Validate input data
         if not scenes_data:
-            error_msg = "No scenes provided for video rendering"
-            logger.error(error_msg)
-            VideoEditor._update_project_status(project_id, 'failed', error_msg)
-            return False, None
+            logger.error("No scenes provided for video combination")
+            return False
 
-        # Validate output directory
-        try:
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        except Exception as e:
-            error_msg = f"Failed to create output directory: {str(e)}"
-            logger.error(error_msg)
-            VideoEditor._update_project_status(project_id, 'failed', error_msg)
-            return False, None
-
-        # Validate input files existence
-        for i, scene in enumerate(scenes_data):
-            media_path = scene.get('media_path')
-            audio_path = scene.get('audio_path')
-
-            if not media_path or not os.path.exists(media_path):
-                error_msg = f"Media file for scene {i + 1} does not exist: {media_path}"
-                logger.error(error_msg)
-                VideoEditor._update_project_status(project_id, 'failed', error_msg)
-                return False, None
-
-            if not audio_path or not os.path.exists(audio_path):
-                error_msg = f"Audio file for scene {i + 1} does not exist: {audio_path}"
-                logger.error(error_msg)
-                VideoEditor._update_project_status(project_id, 'failed', error_msg)
-                return False, None
-
-            # Verify media files can be read by ffmpeg
-            media_info = VideoEditor.verify_media_file(media_path)
-            if not media_info or 'streams' not in media_info:
-                error_msg = f"Media file for scene {i + 1} is invalid or corrupted: {media_path}"
-                logger.error(error_msg)
-                VideoEditor._update_project_status(project_id, 'failed', error_msg)
-                return False, None
-
-            audio_info = VideoEditor.verify_media_file(audio_path)
-            if not audio_info or 'streams' not in audio_info:
-                error_msg = f"Audio file for scene {i + 1} is invalid or corrupted: {audio_path}"
-                logger.error(error_msg)
-                VideoEditor._update_project_status(project_id, 'failed', error_msg)
-                return False, None
-
-            # Log details about each input file
-            logger.debug(f"Scene {i + 1} media: {media_path}")
-            logger.debug(f"Scene {i + 1} audio: {audio_path}")
-
-        # Build FFmpeg input arguments
-        inputs = []
-        filter_chains = []
-        video_streams = []
-        audio_streams = []
-
-        # Standardization parameters
-        TARGET_RESOLUTION = '1920x1080'
-        TARGET_FRAMERATE = 30
-        TARGET_AUDIO_SAMPLE_RATE = 44100
-
-        for index, scene in enumerate(scenes_data):
-            # Add inputs
-            inputs.extend(['-i', scene['media_path']])
-            inputs.extend(['-i', scene['audio_path']])
-
-            # Video processing chain
-            video_filter = (
-                f"[{index * 2}:v]scale={TARGET_RESOLUTION}[v{index}_scaled];"
-                f"[v{index}_scaled]fps={TARGET_FRAMERATE}[v{index}_fps];"
-                f"[v{index}_fps]setpts=PTS-STARTPTS[v{index}]"
-            )
-
-            # Audio processing chain
-            audio_filter = (
-                f"[{index * 2 + 1}:a]aformat=sample_rates={TARGET_AUDIO_SAMPLE_RATE}:channel_layouts=stereo,"
-                f"aresample=async=1,asetpts=PTS-STARTPTS[a{index}]"
-            )
-
-            filter_chains.append(video_filter)
-            filter_chains.append(audio_filter)
-
-            video_streams.append(f"[v{index}]")
-            audio_streams.append(f"[a{index}]")
-
-        # Concatenation filter
-        filter_chains.append(
-            f"{' '.join(video_streams)}concat=n={len(scenes_data)}:v=1:a=0[outv];"
-            f"{' '.join(audio_streams)}concat=n={len(scenes_data)}:v=0:a=1[outa]"
-        )
-
-        # Combine filter_complex into a single string
-        filter_complex_str = ''.join(filter_chains)
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         # Build FFmpeg command
-        cmd = [
-            'ffmpeg', '-y',
-            *inputs,
-            '-filter_complex', filter_complex_str,
-            '-map', '[outv]',
-            '-map', '[outa]',
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
-            '-c:a', 'aac',
-            '-b:a', '192k',
-            '-movflags', '+faststart',
-            output_path
-        ]
+        ffmpeg_cmd = ["ffmpeg", "-y"]  # -y to overwrite output file if exists
 
-        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+        # Add input files (video and audio for each scene)
+        input_files = []
+        for scene in scenes_data:
+            input_files.extend(["-i", scene["media_path"]])  # Video input
+            input_files.extend(["-i", scene["audio_path"]])  # Audio input
+
+        # Build filter_complex for video and audio processing
+        filter_complex = []
+        video_labels = []
+        audio_labels = []
+
+        for i, scene in enumerate(scenes_data):
+            video_idx = 2 * i  # Video input index (0, 2, 4, 6 for 4 scenes)
+            audio_idx = 2 * i + 1  # Audio input index (1, 3, 5, 7 for 4 scenes)
+
+            # Video processing: scale to 1920x1080, set fps, adjust timestamps
+            video_filter = (
+                f"[{video_idx}:v]scale=1920:1080[v{i}_scaled];"
+                f"[v{i}_scaled]fps=30[v{i}_fps];"
+                f"[v{i}_fps]setpts=PTS-STARTPTS[v{i}]"
+            )
+            filter_complex.append(video_filter)
+            video_labels.append(f"[v{i}]")
+
+            # Audio processing: set format, resample, adjust timestamps
+            audio_filter = (
+                f"[{audio_idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                f"aresample=async=1,asetpts=PTS-STARTPTS[a{i}]"
+            )
+            filter_complex.append(audio_filter)
+            audio_labels.append(f"[a{i}]")
+
+        # Concatenate video and audio streams
+        filter_complex.append(
+            f"{' '.join(video_labels)}concat=n={len(scenes_data)}:v=1:a=0[outv];"
+            f"{' '.join(audio_labels)}concat=n={len(scenes_data)}:v=0:a=1[outa]"
+        )
+
+        # Join all filter chains
+        filter_complex_str = "".join(filter_complex)
+
+        # Add filter_complex and output mapping
+        ffmpeg_cmd.extend([
+            *input_files,
+            "-filter_complex", filter_complex_str,
+            "-map", "[outv]",  # Map video output
+            "-map", "[outa]",  # Map audio output
+            "-c:v", "libx264",  # Video codec
+            "-preset", "medium",  # Encoding speed vs. compression
+            "-c:a", "aac",  # Audio codec
+            "-b:a", "192k",  # Audio bitrate
+            "-r", "30",  # Frame rate
+            "-s", "1920x1080",  # Resolution
+            "-f", "mp4",  # Output format
+            output_path
+        ])
 
         try:
-            # Create a temporary file for stderr output
-            with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.log') as stderr_file:
-                stderr_path = stderr_file.name
-
-            # Run the FFmpeg command
-            try:
-                result = subprocess.run(
-                    cmd,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=open(stderr_path, 'w'),
-                    text=True,
-                    encoding='utf-8'
-                )
-
-                # Log successful result
-                logger.info(f"FFmpeg command completed successfully for project_id={project_id}")
-
-                # Check if output file was actually created and has non-zero size
-                if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                    with open(stderr_path, 'r') as f:
-                        stderr_content = f.read()
-
-                    error_msg = f"FFmpeg failed to create a valid output file (file missing or empty)."
-                    logger.error(error_msg)
-                    logger.error(f"FFmpeg stderr: {stderr_content}")
-                    VideoEditor._update_project_status(project_id, 'failed', error_msg)
-                    return False, None
-
-                # Convert to relative path for Django media
-                relative_path = VideoEditor.get_relative_media_path(output_path)
-                return True, relative_path
-
-            except subprocess.CalledProcessError as e:
-                # Read stderr content from file
-                with open(stderr_path, 'r') as f:
-                    stderr_content = f.read()
-
-                error_msg = f"FFmpeg error: {e.returncode}"
-                logger.error(error_msg)
-                logger.error(f"FFmpeg stderr: {stderr_content}")
-
-                # Try to extract more specific error details from stderr
-                specific_error = VideoEditor._extract_ffmpeg_error(stderr_content)
-                if specific_error:
-                    error_msg = f"FFmpeg error: {specific_error}"
-
-                VideoEditor._update_project_status(project_id, 'failed', error_msg)
-                return False, None
-
+            # Run FFmpeg command
+            logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            logger.info(f"FFmpeg completed successfully: {result.stdout}")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg error: {e.returncode}")
+            logger.error(f"FFmpeg stderr: {e.stderr}")
+            return False
         except Exception as e:
-            error_msg = f"General error during video rendering: {str(e)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            VideoEditor._update_project_status(project_id, 'failed', error_msg)
-            return False, None
-        finally:
-            # Clean up stderr log file
-            if 'stderr_path' in locals() and os.path.exists(stderr_path):
-                try:
-                    os.remove(stderr_path)
-                except Exception as e:
-                    logger.warning(f"Failed to clean up stderr log file: {str(e)}")
-
+            logger.error(f"Unexpected error during video combination: {str(e)}")
+            return False
     @staticmethod
     def _extract_ffmpeg_error(stderr_content):
         """Extract meaningful error message from FFmpeg stderr output"""

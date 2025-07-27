@@ -82,7 +82,7 @@ DATABASES = {
         'USER': os.getenv('DB_USER', 'postgres_video_user'),
         'PASSWORD': os.getenv('DB_PASSWORD', 'postgres_usr_pass'),
         'HOST': os.getenv('DB_HOST', 'localhost'),  # Important!
-        'PORT': os.getenv('DB_PORT', '5432'),
+        'PORT': os.getenv('DB_PORT', '5433'),
     }
 }
 
