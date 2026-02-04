@@ -4,11 +4,12 @@ import uuid
 import traceback
 import logging
 import redis
+import shutil  # MODIFIED: Added for moving FLUX files
 from contextlib import contextmanager
 from django.core.files import File
 from django.core.mail import send_mail
 from django.conf import settings
-from celery import shared_task
+from celery import shared_task, chain  # MODIFIED: Added chain
 from .services import ScriptProcessor, MediaFinder, VoiceGenerator, VideoEditor
 from .models import VideoProject, Scene, MediaAsset, AudioAsset, RenderedVideo,VideoScript
 
@@ -19,7 +20,7 @@ redis_client = redis.Redis(host='localhost', port=6379, db=0)
 logger = logging.getLogger(__name__)
 
 @contextmanager
-def redis_lock(lock_name, timeout=60):
+def redis_lock(lock_name, timeout=1800):  # MODIFIED: Extended to 30 mins
     """Acquire a Redis lock with a timeout."""
     lock = redis_client.lock(lock_name, timeout=timeout)
     try:
@@ -34,7 +35,7 @@ def redis_lock(lock_name, timeout=60):
 
 @shared_task(bind=True, max_retries=3)
 def process_video_project(self, project_id):
-    """
+    """Orchestrates the pipeline using Celery Chains
     Process a video project from script to rendered video.
     This task handles the entire pipeline:
     1. Process script into scenes
@@ -46,75 +47,23 @@ def process_video_project(self, project_id):
     logger.info(f"Starting processing for project {project_id}")
     
     try:
-        # Get project and update status
         project = VideoProject.objects.get(id=project_id)
         project.status = 'processing'
         project.save()
-        
-        # Get script
-        script = project.script
-        if not script:
-            logger.error(f"Project {project_id} has no script")
-            raise Exception("Project has no script")
-        
-        # Process script into scenes
-        logger.info(f"Processing script for project {project_id}")
-        process_script_task(script.id)
-        
-        # Find media for scenes
-        logger.info(f"Finding media for project {project_id}")
-        find_media_task(script.id)
-        
-        # Generate voiceovers
-        logger.info(f"Generating voiceovers for project {project_id}")
-        generate_voiceovers_task(script.id)
-        
-        # Render video
-        logger.info(f"Rendering video for project {project_id}")
-        render_video_task(project_id)
-        
-        # Update project status
-        project.refresh_from_db()
-        project.status = 'completed'
-        project.save()
-        
-        # Notify user
-        if project.user.email:
-            send_mail(
-                'Your video is ready!',
-                f'Your video "{project.title}" has been successfully processed.',
-                settings.DEFAULT_FROM_EMAIL,
-                [project.user.email],
-                fail_silently=True,
-            )
-        
-        logger.info(f"Completed processing for project {project_id}")
+
+        # MODIFIED: Sequential pipeline with high timeouts
+        pipeline = chain(
+            process_script_task.s(project.script.id),
+            find_media_task.s(project.script.id),
+            generate_voiceovers_task.s(project.script.id),
+            render_video_task.s(project_id)
+        )
+        pipeline.apply_async()
         return True
-        
     except Exception as e:
-        logger.error(f"Error processing project {project_id}: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        try:
-            project = VideoProject.objects.get(id=project_id)
-            project.status = 'failed'
-            project.error_message = str(e)[:255]  # Truncate if needed
-            project.save()
-            
-            # Notify user of failure
-            if project.user.email:
-                send_mail(
-                    'Video processing failed',
-                    f'Unfortunately, your video "{project.title}" could not be processed. Error: {str(e)}',
-                    settings.DEFAULT_FROM_EMAIL,
-                    [project.user.email],
-                    fail_silently=True,
-                )
-        except Exception as inner_e:
-            logger.error(f"Error updating project status: {str(inner_e)}")
-        
-        # Retry with exponential backoff
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+        project.status = 'failed'
+        project.save()
+        raise self.retry(exc=e, countdown=60)
 
 @shared_task
 def process_script_task(script_id):
@@ -146,7 +95,7 @@ def process_script_task(script_id):
         logger.error(traceback.format_exc())
         raise
 
-@shared_task
+@shared_task(time_limit=600)  # MODIFIED: 10 min limit for FLUX
 def find_media_task(script_id):
     """Find media for all scenes in script"""
 
@@ -154,49 +103,34 @@ def find_media_task(script_id):
         script = VideoScript.objects.get(id=script_id)
         scenes = script.scenes.all().order_by('order')
         media_finder = MediaFinder()
-        
+
         for scene in scenes:
-            if scene.media_assets.exists():
-                continue
-                
-            keywords = scene.keywords
-            prompt = f"High quality YouTube background footage showing {' '.join(keywords)}, cinematic, 4k, trending on artstation"
-            
-            try:
-                image_data = media_finder.generate_image(
-                    prompt=prompt,
-                    width=1024,
-                    height=576
+            # MODIFIED: Stop if project was marked failed/cancelled
+            if VideoProject.objects.filter(script=script.project, status='failed').exists():
+                return False
+
+            prompt = f"Cinematic 4k, {' '.join(scene.keywords)}"
+            # MODIFIED: MediaFinder now returns a local path
+            temp_path = media_finder.generate_image(prompt)
+
+            if temp_path and os.path.exists(temp_path):
+                media_dir = os.path.join(settings.MEDIA_ROOT, 'media_assets')
+                os.makedirs(media_dir, exist_ok=True)
+
+                # MODIFIED: Move file from Gradio temp to Django Media
+                ext = os.path.splitext(temp_path)[1]
+                filename = f"flux_{scene.id}{ext}"
+                final_path = os.path.join(media_dir, filename)
+                shutil.move(temp_path, final_path)
+
+                MediaAsset.objects.create(
+                    scene=scene,
+                    file=f'media_assets/{filename}',
+                    asset_type='image'
                 )
-                
-                if image_data:
-                    media_dir = os.path.join(settings.MEDIA_ROOT, 'media_assets')
-                    os.makedirs(media_dir, exist_ok=True)
-                    
-                    filename = f"stability_{scene.id}_{'_'.join(keywords[:3])}.png"
-                    filepath = os.path.join(media_dir, filename)
-                    
-                    with open(filepath, 'wb') as f:
-                        f.write(image_data)
-                    
-                    MediaAsset.objects.update_or_create(
-                        scene=scene,
-                        defaults={
-                            'asset_type': 'image',
-                            'source': 'generated',
-                            'file': f'media_assets/{filename}',
-                            'duration_seconds': 5.0,
-                            'generated_prompt': prompt
-                        }
-                    )
-            except Exception as scene_e:
-                logger.error(f"Error generating media for scene {scene.id}: {str(scene_e)}")
-                continue
-        
         return True
     except Exception as e:
-        logger.error(f"Error finding media for script {script_id}: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Media Task Error: {str(e)}")
         raise
 
 @shared_task

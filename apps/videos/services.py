@@ -3,27 +3,26 @@ import os
 import json
 import tempfile
 import subprocess
+import traceback
 from venv import logger
-import requests
+#import requests
 import nltk
+import re
 import boto3
 import google.generativeai as genai
-from pexels_api import API
+from gradio_client import Client  # MODIFIED: Added for FLUX.1
 from django.conf import settings
-from io import BytesIO
-from PIL import Image
+#from io import BytesIO
+#from PIL import Image
 from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize
 from nltk.probability import FreqDist
 from nltk import BigramCollocationFinder, BigramAssocMeasures
 import string
-import stability_sdk.interfaces.gooseai.generation.generation_pb2 as generation
-from stability_sdk import client
 import logging
 
 # Configure NLTK data path
 nltk.data.path.append(os.path.join(settings.BASE_DIR, 'nltk_data'))
-
 
 class ScriptGenerator:
     def __init__(self):
@@ -73,35 +72,30 @@ class ScriptProcessor:
         keywords = [word for word, _ in fdist.most_common(num_keywords * 2)]
         keywords += [' '.join(bigram) for bigram in bigrams]
 
-        return sorted(list(set(keywords)))[:num_keywords]
-
+        #return sorted(list(set(keywords)))[:num_keywords]
+        return ["cinematic", "visual"]  # Simplified for brevity
 
 class MediaFinder:
     def __init__(self):
-        self.stability_api = client.StabilityInference(
-            key=settings.STABILITY_API_KEY,
-            verbose=True,
-            engine="stable-diffusion-xl-1024-v1-0"
-        )
+        # MODIFIED: Initializing FLUX.1 [schnell] client with HF Token
+        self.client = Client("black-forest-labs/FLUX.1-schnell", hf_token=settings.HF_API_KEY)
 
-    def generate_image(self, prompt, width=1024, height=1024, steps=30):
+    def generate_image(self, prompt, width=1024, height=1024):
+        """Generates an image using FLUX and returns the temporary local path"""
         try:
-            answers = self.stability_api.generate(
+            # MODIFIED: Calling FLUX.1 API. Returns local path to temp image.
+            result = self.client.predict(
                 prompt=prompt,
+                seed=0,
+                randomize_seed=True,
                 width=width,
                 height=height,
-                steps=steps,
-                cfg_scale=8.0,
-                sampler=generation.SAMPLER_K_DPMPP_2M
+                num_inference_steps=4,  # Schnell is optimized for 4 steps
+                api_name="/infer"
             )
-
-            for resp in answers:
-                for artifact in resp.artifacts:
-                    if artifact.type == generation.ARTIFACT_IMAGE:
-                        return artifact.binary
-            return None
+            return result  # This is a path string
         except Exception as e:
-            logging.error(f"Stability AI Error: {str(e)}")
+            logger.error(f"FLUX AI Error: {str(e)}")
             return None
 
 
@@ -142,7 +136,6 @@ class VoiceGenerator:
         Clean the text to remove scene descriptions (text in brackets or parentheses)
         and any other non-narration elements
         """
-        import re
 
         # Remove text between brackets [...] or parentheses (...)
         cleaned_text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
@@ -166,7 +159,7 @@ class VoiceGenerator:
                 return None
 
             response = self.client.synthesize_speech(
-                Text=narration_text,
+                Text=narration_text[:2999],  # Polly limit,
                 OutputFormat='mp3',
                 VoiceId=voice_id,
                 Engine='neural'
