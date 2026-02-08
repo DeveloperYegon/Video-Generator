@@ -1,44 +1,69 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:alpine
-    ports:
-      - "6379:6379"
     volumes:
       - redis_data:/data
 
-  ffmpeg:
-    image: jrottenberg/ffmpeg
-    volumes:
-      - ./media:/media
-    command: ["-version"]  # Keep container running
-
-  postgres:
-    image: postgres:15
+  db:
+    image: postgres:${POSTGRES_VERSION:-15}
     environment:
-      POSTGRES_DB: videomaker_dev
-      POSTGRES_USER: postgres_video_user
-      POSTGRES_PASSWORD: postgres_usr_pass
-    ports:
-      - "5433:5432"
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # We expose 5433 to your laptop to avoid conflict with local Postgres
+    ports:
+      - "5433:5432"
 
+  web:
+    build: .
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - .:/app
+      - shared_media:/app/media
+      - shared_nltk:/app/nltk_data
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:  
+      - CONTAINER_TYPE=web
+      - DJANGO_DEBUG=True
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - REDIS_HOST=redis
+      - DB_HOST=db
+      - DB_PORT=5432
+    depends_on:
+      - db
+      - redis
 
-  # web:
-  #     build: .
-  #     command: python manage.py runserver 0.0.0.0:8000
-  #     volumes:
-  #       - .:/app
-  #     ports:
-  #       - "8000:8000"
-  #     env_file:
-  #       - .env
-  #     depends_on:
-  #       - postgres
+  worker:
+    build: .
+    command: celery -A config worker --loglevel=info
+    volumes:
+      - .:/app
+      - shared_media:/app/media
+      - shared_nltk:/app/nltk_data
+    env_file: .env
+    environment:
+      - CONTAINER_TYPE=worker
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DB_HOST=db
+      - REDIS_HOST=redis
+      - DB_PORT=5432
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    depends_on:
+      - db
+      - redis
 
-
+# ALL named volumes used above MUST be defined here
 volumes:
   redis_data:
   postgres_data:
+  shared_media:
+  shared_nltk:

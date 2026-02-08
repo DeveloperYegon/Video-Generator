@@ -13,9 +13,20 @@ urlpatterns = [
 ]
 
 
-#Add debug toolbar and media URLs if in DEBUG mode
+
+# Only add debug toolbar if in DEBUG mode AND the package exists
 if settings.DEBUG:
-    import debug_toolbar
-    urlpatterns = [
-        path('__debug__/', include(debug_toolbar.urls)),
-    ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT) + urlpatterns
+    try:
+        import debug_toolbar
+        urlpatterns += [path('__debug__/', include(debug_toolbar.urls))]
+    except ImportError:
+        pass
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    
+#import debug_toolbar
+#if settings.DEBUG:
+  #  urlpatterns = [
+    #    path('__debug__/', include(debug_toolbar.urls)),
+    # + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT) + urlpatterns

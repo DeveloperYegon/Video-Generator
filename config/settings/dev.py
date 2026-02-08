@@ -1,21 +1,23 @@
+#\Video-Generator-main\config\settings\dev.py
 from .base import *
 import socket
 # Debug settings
 DEBUG = True
 ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
-SILENCED_SYSTEM_CHECKS = ['debug_toolbar.W004']
+#SILENCED_SYSTEM_CHECKS = ['debug_toolbar.W004']
+
 # Django Debug Toolbar
-INSTALLED_APPS += ['debug_toolbar']
+#INSTALLED_APPS += ['debug_toolbar']
 #MIDDLEWARE.insert(0, 'debug_toolbar.middleware.DebugToolbarMiddleware')
 
 # Debug Toolbar configuration
-DEBUG_TOOLBAR_CONFIG = {
-    'SHOW_TOOLBAR_CALLBACK': lambda request: True,
-}
+#DEBUG_TOOLBAR_CONFIG = {
+ #   'SHOW_TOOLBAR_CALLBACK': lambda request: True,
+#}
 
 # Configure internal IPs for Debug Toolbar
-hostname, _, ips = socket.gethostbyname_ex(socket.gethostname())
-INTERNAL_IPS = [ip[: ip.rfind(".")] + ".1" for ip in ips] + ["127.0.0.1",'localhost', "10.0.2.2"]
+#hostname, _, ips = socket.gethostbyname_ex(socket.gethostname())
+#INTERNAL_IPS = [ip[: ip.rfind(".")] + ".1" for ip in ips] + ["127.0.0.1",'localhost', "10.0.2.2"]
 
 # Database
 DATABASES = {

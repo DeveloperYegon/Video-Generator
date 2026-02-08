@@ -1,12 +1,12 @@
-
+#Video-Generator-main\config\settings\base.py
 from pathlib import Path
 import os
 import nltk
+from dotenv import load_dotenv
 from django.core.management.utils import get_random_secret_key
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
-from dotenv import load_dotenv
 load_dotenv()
 
 # Quick-start development settings - unsuitable for production
@@ -38,7 +38,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'debug_toolbar.middleware.DebugToolbarMiddleware',
+   # 'debug_toolbar.middleware.DebugToolbarMiddleware',
+   'whitenoise.middleware.WhiteNoiseMiddleware', # Add for Production static files
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -78,11 +79,11 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME', 'videomaker_dev'),
-        'USER': os.getenv('DB_USER', 'postgres_video_user'),
-        'PASSWORD': os.getenv('DB_PASSWORD', 'postgres_usr_pass'),
-        'HOST': os.getenv('DB_HOST', 'localhost'),  # Important!
-        'PORT': os.getenv('DB_PORT', '5433'),
+        'NAME': os.getenv('DB_NAME'),
+        'USER': os.getenv('DB_USER'),
+        'PASSWORD': os.getenv('DB_PASSWORD'),
+        'HOST': os.getenv('DB_HOST', 'db'),  # Important!
+        'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
 
@@ -132,15 +133,27 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Celery settings
-CELERY_BROKER_URL =  os.getenv('CELERY_BROKER', 'redis://localhost:6379/0') # or your broker URL
-CELERY_RESULT_BACKEND =  os.getenv('CELERY_BACKEND', 'redis://localhost:6379/0')
+# When running in Docker (CONTAINER_TYPE set), always use redis service host so .env cannot override to localhost
+_default_broker = 'redis://redis:6379/0'
+if os.getenv('CONTAINER_TYPE'):
+    CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', _default_broker)
+    if 'localhost' in (CELERY_BROKER_URL or '') or '127.0.0.1' in (CELERY_BROKER_URL or ''):
+        CELERY_BROKER_URL = _default_broker
+    CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', _default_broker)
+    if 'localhost' in (CELERY_RESULT_BACKEND or '') or '127.0.0.1' in (CELERY_RESULT_BACKEND or ''):
+        CELERY_RESULT_BACKEND = _default_broker
+else:
+    CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', _default_broker)
+    CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', _default_broker)
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 
 # Configuration for external services
-PEXELS_API_KEY = os.getenv('PEXELS_API_KEY')
+#PEXELS_API_KEY = os.getenv('PEXELS_API_KEY')
+HF_API_KEY = os.getenv('HF_API_KEY')
+
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_REGION = os.getenv('AWS_REGION')
@@ -161,11 +174,11 @@ os.makedirs(NLTK_DATA_PATH, exist_ok=True)
 nltk.data.path.append(NLTK_DATA_PATH)
 
 STATIC_URL = 'static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
 STATICFILES_DIRS = [
-    BASE_DIR / "static",
+    os.path.join(BASE_DIR, 'static'),
 ]
 
-STATIC_ROOT = BASE_DIR / 'staticfiles'
-
-STABILITY_API_KEY = os.getenv('STABILITY_API_KEY')  # Get from Stability AI platform
+#STABILITY_API_KEY = os.getenv('STABILITY_API_KEY')  # Get from Stability AI platform
 MEDIA_GENERATION_STYLE = "cinematic"  # Options: cinematic, photography, anime, etc.

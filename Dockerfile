@@ -1,34 +1,26 @@
-# Use official Python image as base
 FROM python:3.11-slim
-
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
-
-# Set working directory inside container
-WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    build-essential \
+    ffmpeg \
     libpq-dev \
+    gcc \
+    netcat-traditional \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file and install Python dependencies
-COPY requirements.txt /app/
-RUN pip install --upgrade pip
-RUN pip install -r requirements.txt
+WORKDIR /app
 
-# Copy project files into container
-COPY . /app/
+# Install Python requirements
+COPY requirements.txt .
+RUN mkdir -p /app/nltk_data
+RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('stopwords')"
 
-# Collect static files (optional - adjust if you use static files)
-RUN python manage.py collectstatic --noinput
 
-# Expose port 8000 for Django app
-EXPOSE 8000
+COPY . .
 
-RUN cat /etc/resolv.conf
+# Make entrypoint executable
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
-# Command to run the app with gunicorn
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000"]
+# Set the entrypoint
+ENTRYPOINT ["/app/entrypoint.sh"]

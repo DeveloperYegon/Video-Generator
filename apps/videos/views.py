@@ -1,3 +1,4 @@
+
 # apps/videos/views.py
 from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib import messages 
@@ -205,6 +206,8 @@ def processing_status(request, project_id, step):
     return render(request, 'videos/processing_status.html', context)
 
 
+
+    
 @ login_required
 def process_script(request, project_id):
     """Process script into scenes using Celery task"""

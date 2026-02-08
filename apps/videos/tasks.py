@@ -1,49 +1,38 @@
-# apps/videos/tasks.py
 import os
 import uuid
 import traceback
 import logging
+import shutil
 import redis
-import shutil  # MODIFIED: Added for moving FLUX files
 from contextlib import contextmanager
+import time
+
+import httpx
 from django.core.files import File
 from django.core.mail import send_mail
 from django.conf import settings
-from celery import shared_task, chain  # MODIFIED: Added chain
+from django.db import transaction # ADDED: For database integrity
+from celery import shared_task, chain
+
 from .services import ScriptProcessor, MediaFinder, VoiceGenerator, VideoEditor
-from .models import VideoProject, Scene, MediaAsset, AudioAsset, RenderedVideo,VideoScript
+from .models import VideoProject, Scene, MediaAsset, AudioAsset, RenderedVideo, VideoScript
 
+# MODIFIED: Define the variable FIRST, then use it.
+# This ensures it works on your laptop (via 'redis' hostname) and avoids NameError.
+REDIS_HOST = os.getenv('REDIS_HOST', 'redis') 
 
-# Initialize Redis client
-redis_client = redis.Redis(host='localhost', port=6379, db=0)
+# Initialize Redis client correctly
+redis_client = redis.Redis(
+    host=REDIS_HOST, 
+    port=6379, 
+    db=0
+)
 
 logger = logging.getLogger(__name__)
 
-@contextmanager
-def redis_lock(lock_name, timeout=1800):  # MODIFIED: Extended to 30 mins
-    """Acquire a Redis lock with a timeout."""
-    lock = redis_client.lock(lock_name, timeout=timeout)
-    try:
-        acquired = lock.acquire(blocking_timeout=10)
-        if not acquired:
-            raise Exception(f"Could not acquire lock: {lock_name}")
-        yield
-    finally:
-        if lock.locked():
-            lock.release()
-
-
 @shared_task(bind=True, max_retries=3)
 def process_video_project(self, project_id):
-    """Orchestrates the pipeline using Celery Chains
-    Process a video project from script to rendered video.
-    This task handles the entire pipeline:
-    1. Process script into scenes
-    2. Generate media for each scene
-    3. Generate voiceovers 
-    4. Render final video
-    """
-
+    """Orchestrates the pipeline using Celery Chains"""
     logger.info(f"Starting processing for project {project_id}")
     
     try:
@@ -51,7 +40,7 @@ def process_video_project(self, project_id):
         project.status = 'processing'
         project.save()
 
-        # MODIFIED: Sequential pipeline with high timeouts
+        # Sequential chain: ensures data exists before next step starts
         pipeline = chain(
             process_script_task.s(project.script.id),
             find_media_task.s(project.script.id),
@@ -63,71 +52,89 @@ def process_video_project(self, project_id):
     except Exception as e:
         project.status = 'failed'
         project.save()
+        logger.error(f"Pipeline initiation failed: {str(e)}")
         raise self.retry(exc=e, countdown=60)
 
 @shared_task
 def process_script_task(script_id):
     """Process script into scenes with keywords"""
-
     try:
-        script = VideoScript.objects.get(id=script_id)
-        processor = ScriptProcessor()
-        
-        # Segment script into scenes
-        sentences = processor.segment_script(script.original_text)
-        
-        # Clear existing scenes
-        Scene.objects.filter(script=script).delete()
-        
-        # Create new scenes
-        for i, sentence in enumerate(sentences):
-            keywords = processor.extract_keywords(sentence)
-            Scene.objects.create(
-                script=script,
-                order=i + 1,
-                text=sentence,
-                keywords=keywords
-            )
-        
+        # Atomic transaction ensures scenes are fully created before chain proceeds
+        with transaction.atomic():
+            script = VideoScript.objects.get(id=script_id)
+            processor = ScriptProcessor()
+            sentences = processor.segment_script(script.original_text)
+            
+            Scene.objects.filter(script=script).delete()
+            
+            for i, sentence in enumerate(sentences):
+                keywords = processor.extract_keywords(sentence)
+                Scene.objects.create(
+                    script=script,
+                    order=i + 1,
+                    text=sentence,
+                    keywords=keywords
+                )
         return True
     except Exception as e:
         logger.error(f"Error processing script {script_id}: {str(e)}")
-        logger.error(traceback.format_exc())
         raise
 
-@shared_task(time_limit=600)  # MODIFIED: 10 min limit for FLUX
+@shared_task(time_limit=600)
 def find_media_task(script_id):
-    """Find media for all scenes in script"""
-
+    """Find media for all scenes in script via FLUX API"""
     try:
         script = VideoScript.objects.get(id=script_id)
         scenes = script.scenes.all().order_by('order')
         media_finder = MediaFinder()
+        saved_count = 0
 
         for scene in scenes:
-            # MODIFIED: Stop if project was marked failed/cancelled
-            if VideoProject.objects.filter(script=script.project, status='failed').exists():
-                return False
-
             prompt = f"Cinematic 4k, {' '.join(scene.keywords)}"
-            # MODIFIED: MediaFinder now returns a local path
-            temp_path = media_finder.generate_image(prompt)
+            try:
+                temp_path = media_finder.generate_image(prompt)
+                time.sleep(10)
+            except (httpx.ConnectError, OSError) as e:
+                errno = getattr(e, 'errno', None)
+                if errno == -5 or 'hostname' in str(e).lower() or 'address' in str(e).lower():
+                    raise RuntimeError(
+                        "Cannot reach Hugging Face FLUX API (DNS/network). "
+                        "From Docker: ensure the worker has outbound internet and DNS (e.g. in docker-compose add: dns: [8.8.8.8] under worker). "
+                        "Check HF_API_KEY and firewall/proxy."
+                    ) from e
+                raise
 
             if temp_path and os.path.exists(temp_path):
                 media_dir = os.path.join(settings.MEDIA_ROOT, 'media_assets')
                 os.makedirs(media_dir, exist_ok=True)
 
-                # MODIFIED: Move file from Gradio temp to Django Media
                 ext = os.path.splitext(temp_path)[1]
-                filename = f"flux_{scene.id}{ext}"
+                filename = f"flux_{scene.id}_{uuid.uuid4().hex[:6]}{ext}"
                 final_path = os.path.join(media_dir, filename)
-                shutil.move(temp_path, final_path)
+                
+                # CLOUD FIX: In Docker, moving between /tmp and /app/media 
+                # can be a cross-device link error. Fallback to copy.
+                try:
+                    shutil.move(temp_path, final_path)
+                except OSError:
+                    shutil.copy(temp_path, final_path)
+                    os.remove(temp_path)
 
-                MediaAsset.objects.create(
+                MediaAsset.objects.update_or_create(
                     scene=scene,
-                    file=f'media_assets/{filename}',
-                    asset_type='image'
+                    defaults={
+                        'file': f'media_assets/{filename}',
+                        'asset_type': 'image'
+                    }
                 )
+                saved_count += 1
+
+        if saved_count == 0:
+            logger.error("find_media_task: FLUX returned no images (check worker logs for FLUX AI Error / RuntimeError). HF space may have changed API or returned errors.")
+            raise RuntimeError(
+                "FLUX image generation produced no images. Check worker logs for 'FLUX AI Error' (e.g. RuntimeError from HF space). "
+                "Ensure HF_API_KEY is valid and the space black-forest-labs/FLUX.1-schnell is up."
+            )
         return True
     except Exception as e:
         logger.error(f"Media Task Error: {str(e)}")
@@ -135,166 +142,101 @@ def find_media_task(script_id):
 
 @shared_task
 def generate_voiceovers_task(script_id):
-    """Generate voiceovers for all scenes in script"""
-
+    """Generate voiceovers for all scenes"""
     try:
         script = VideoScript.objects.get(id=script_id)
         scenes = script.scenes.all().order_by('order')
         voice_gen = VoiceGenerator()
-        
-        # Get the selected voice ID from the script
         voice_id = script.voice_id
         
-        # Remove existing audio assets
+        # Cleanup old voiceovers
         AudioAsset.objects.filter(scene__script=script).delete()
         
         for scene in scenes:
-            # Generate voiceover with the selected voice
             audio_file = voice_gen.generate_voiceover(scene.text, voice_id=voice_id)
-            
-            # Skip if no audio was generated (e.g., empty text after cleaning)
             if not audio_file:
                 continue
                 
-            # Create audio asset
             with open(audio_file, 'rb') as f:
-                audio_asset = AudioAsset.objects.create(
-                    scene=scene,
-                    voice_id=voice_id
-                )
-                audio_asset.file.save(f'{uuid.uuid4()}.mp3', File(f))
+                audio_asset = AudioAsset.objects.create(scene=scene, voice_id=voice_id)
+                # save() handles the actual file placement in settings.MEDIA_ROOT
+                audio_asset.file.save(f'vo_{scene.id}.mp3', File(f))
                 
-            # Clean up
-            os.unlink(audio_file)
-        
+            if os.path.exists(audio_file):
+                os.unlink(audio_file)
         return True
     except Exception as e:
-        logger.error(f"Error generating voiceovers for script {script_id}: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Voiceover Error: {str(e)}")
         raise
-#@shared_task(bind=True, max_retries=3, autoretry_for=(Exception,), retry_backoff=True)
-@shared_task(bind=True, max_retries=3)
+
+@shared_task(bind=True, max_retries=5)
 def render_video_task(self, project_id):
-    from .models import VideoProject, Scene, MediaAsset
-    from .services import VideoEditor
-    import logging
-    import os
-    from django.core.mail import send_mail
-    from django.conf import settings
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"Starting video rendering for project {project_id}")
-
+    """Renders final video using FFmpeg inside the Docker container"""
     try:
         project = VideoProject.objects.get(id=project_id)
-    except VideoProject.DoesNotExist:
-        logger.error(f"VideoProject with id {project_id} does not exist")
-        return False
+        # Use select_related/prefetch_related for cloud DB efficiency
+        scenes = Scene.objects.filter(script__project=project).order_by('order').prefetch_related('media_assets')
+        
+        scenes_data = []
+        missing_assets = []
 
-    scenes = Scene.objects.filter(script__project=project).order_by('order')
-    logger.info(f"Found {len(scenes)} scenes for project {project_id}")
+        for scene in scenes:
+            media = scene.media_assets.first()
+            # Correcting the reverse lookup for AudioAsset (assumes OneToOne or ForeignKey)
+            audio = getattr(scene, 'audio_asset', None)
 
-    scenes_data = []
-    scenes_missing_media = []
+            if not media or not os.path.exists(media.file.path):
+                missing_assets.append(f"Scene {scene.order} Image")
+            elif not audio or not os.path.exists(audio.file.path):
+                missing_assets.append(f"Scene {scene.order} Audio")
+            else:
+                scenes_data.append({
+                    'media_path': media.file.path,
+                    'audio_path': audio.file.path,
+                    'text': scene.text
+                })
 
-    for scene in scenes:
-        media_asset = scene.media_assets.first()
-        audio_asset = scene.audio_asset if hasattr(scene, 'audio_asset') else None
+        # Retry if assets are missing (e.g. storage hasn't synced yet)
+        if missing_assets:
+            if self.request.retries >= self.max_retries:
+                raise Exception(f"Final Render Attempt Failed: Missing {missing_assets}")
+            logger.info(f"Retrying render... missing: {missing_assets}")
+            raise self.retry(countdown=30)
 
-        if not media_asset or not os.path.exists(media_asset.file.path):
-            scenes_missing_media.append(scene.order)
-            continue
+        # Output folder for the render process
+        render_output = os.path.join(settings.MEDIA_ROOT, 'renders', f"{uuid.uuid4().hex}.mp4")
+        os.makedirs(os.path.dirname(render_output), exist_ok=True)
 
-        if not audio_asset or not os.path.exists(audio_asset.file.path):
-            scenes_missing_media.append(scene.order)
-            continue
-
-        media_info = VideoEditor.verify_media_file(media_asset.file.path)
-        if not media_info:
-            logger.warning(f"Invalid media file for scene {scene.order}: {media_asset.file.name}")
-            scenes_missing_media.append(scene.order)
-            continue
-
-        audio_info = VideoEditor.verify_media_file(audio_asset.file.path)
-        if not audio_info:
-            logger.warning(f"Invalid audio file for scene {scene.order}: {audio_asset.file.name}")
-            scenes_missing_media.append(scene.order)
-            continue
-
-        scenes_data.append({
-            'media_path': media_asset.file.path,
-            'audio_path': audio_asset.file.path,
-            'text': scene.text,
-            'duration_seconds': media_asset.duration_seconds
-        })
-
-    if scenes_missing_media:
-        logger.error(f"Cannot render video: Missing media for scenes: {scenes_missing_media}")
-        logger.info("Attempting to regenerate missing media assets")
-        from .tasks import find_media_task, generate_voiceovers_task
-        script = project.script
-        find_media_task.delay(script.id)
-        generate_voiceovers_task.delay(script.id)
-        project.status = 'failed'
-        project.error_message = f"Missing media for scenes: {scenes_missing_media}"
-        project.save()
-        if project.user.email:
-            send_mail(
-                'Video processing failed',
-                f'Unfortunately, your video "{project.title}" could not be processed. Error: {project.error_message}',
-                settings.DEFAULT_FROM_EMAIL,
-                [project.user.email],
-                fail_silently=True,
-            )
-        raise self.retry(countdown=60 * (2 ** self.request.retries))
-
-    if not scenes_data:
-        error_message = "No valid scenes available for rendering"
-        logger.error(error_message)
-        project.status = 'failed'
-        project.error_message = error_message
-        project.save()
-        if project.user.email:
-            send_mail(
-                'Video processing failed',
-                f'Unfortunately, your video "{project.title}" could not be processed. Error: {error_message}',
-                settings.DEFAULT_FROM_EMAIL,
-                [project.user.email],
-                fail_silently=True,
-            )
-        return False
-
-    logger.info(f"Rendering video with {len(scenes_data)} scenes for project {project_id}")
-    output_path = os.path.join(settings.MEDIA_ROOT, 'rendered_videos', f'project_{project_id}', f'video_{project_id}.mp4')
-
-    try:
-        # Call the correct method: combine_videos instead of combine_scenes
-        success = VideoEditor.combine_videos(project_id, scenes_data, output_path)
+        editor = VideoEditor()
+        # Ensure combine_videos is the correct method name in your VideoEditor class
+        success = editor.combine_videos(project_id, scenes_data, render_output)
+        
         if success:
-            media_url = os.path.join(settings.MEDIA_URL, 'rendered_videos', f'project_{project_id}', f'video_{project_id}.mp4')
+            with open(render_output, 'rb') as f:
+                RenderedVideo.objects.create(
+                    project=project,
+                    file=File(f, name=f"video_{project_id}.mp4")
+                )
             project.status = 'completed'
-            project.media_url = media_url
-            project.error_message = ''
             project.save()
-            logger.info(f"Updated project {project_id} status to 'completed'")
+            
+            if os.path.exists(render_output):
+                os.remove(render_output)
             return True
         else:
-            raise Exception("Video rendering failed. Check logs for details.")
+            raise Exception("FFmpeg process returned False")
+
     except Exception as e:
-        logger.error(f"Error acquiring lock or rendering video for project {project_id}: {str(e)}")
-        project.status = 'failed'
-        project.error_message = str(e)[:255]
-        project.save()
-        logger.info(f"Updated project {project_id} status to 'failed'")
-        if project.user.email:
+        logger.error(f"Render Error project {project_id}: {str(e)}")
+        if self.request.retries >= self.max_retries:
+            project.status = 'failed'
+            project.save()
+            # Only email on absolute failure
             send_mail(
-                'Video processing failed',
-                f'Unfortunately, your video "{project.title}" could not be processed. Error: {str(e)}',
+                "Video Generation Failed",
+                f"Project {project_id} failed. Error: {str(e)}",
                 settings.DEFAULT_FROM_EMAIL,
                 [project.user.email],
-                fail_silently=True,
+                fail_silently=True
             )
-        if self.request.retries < self.max_retries:
-            logger.info(f"Scheduling retry ({self.request.retries + 1}/{self.max_retries}) for project {project_id}")
-            raise self.retry(countdown=60 * (2 ** self.request.retries))
-        return False
+        raise self.retry(exc=e, countdown=60)
