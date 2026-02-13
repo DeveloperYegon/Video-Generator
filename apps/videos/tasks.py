@@ -147,13 +147,14 @@ def generate_voiceovers_task(script_id):
         script = VideoScript.objects.get(id=script_id)
         scenes = script.scenes.all().order_by('order')
         voice_gen = VoiceGenerator()
-        voice_id = script.voice_id
+        voice_id = script.voice_id # Gemini voices: Puck, Charon, etc.
         
         # Cleanup old voiceovers
         AudioAsset.objects.filter(scene__script=script).delete()
         
         for scene in scenes:
             audio_file = voice_gen.generate_voiceover(scene.text, voice_id=voice_id)
+            time.sleep(4)
             if not audio_file:
                 continue
                 

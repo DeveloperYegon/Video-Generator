@@ -34,8 +34,8 @@ def edit_script(request, project_id):
     
     from .services import VoiceGenerator
     voice_gen = VoiceGenerator()
-    voice_choices = [(voice_id, f"{voice_id} - {description}") for voice_id, description in voice_gen.get_available_voices().items()]
-
+    voice_choices = [(v, v) for v in voice_gen.get_available_voices()]
+    
     try:
         script = project.script
         voice_id = script.voice_id

@@ -5,7 +5,6 @@ import json
 import tempfile
 import subprocess
 import traceback
-# import requests
 import re
 import boto3
 import google.generativeai as genai
@@ -122,109 +121,79 @@ class ScriptProcessor:
             return ["cinematic", "visual", "atmospheric"]
             
 class MediaFinder:
-    """Finds/generates scene images via Hugging Face FLUX.1 Gradio. Lazy-inits client to avoid DNS/network errors at import."""
-
-    FLUX_SPACE = "black-forest-labs/FLUX.1-schnell"
 
     def __init__(self):
-        self.hf_token = getattr(settings, 'HF_API_KEY', os.getenv('HF_API_KEY'))
-        self._client = None  # Lazy init so Docker worker doesn't fail on HF DNS in __init__
+            genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+            self.model = genai.GenerativeModel('gemini-2.5-flash-image')
 
-    def _get_client(self):
-        """Create Gradio client on first use. Catches DNS/network errors (e.g. in Docker with no outbound DNS)."""
-        if self._client is not None:
-            return self._client
-        try:
-            self._client = Client(self.FLUX_SPACE, token=self.hf_token)
-            return self._client
-        except Exception as e:
-            logger.exception("FLUX Gradio client init failed (check network/DNS and HF_API_KEY).")
-            raise
 
     def generate_image(self, prompt, width=1024, height=1024):
-        client = self._get_client()  # Let ConnectError/OSError propagate so task can raise a clear message
-        max_attempts = 3
-        delays = (5, 15)  # seconds between retries (transient OOM/queue on HF free tier)
-        for attempt in range(1, max_attempts + 1):
-            try:
-                result = client.predict(
-                    prompt=prompt,
-                    seed=0,
-                    randomize_seed=True,
-                    width=width,
-                    height=height,
-                    num_inference_steps=4,
-                    api_name="/infer"
-                )
-                # API returns (image_path, seed) per space config; extract path
-                if isinstance(result, (list, tuple)):
-                    result = next((x for x in result if isinstance(x, str) and ("/" in x or "\\" in x)), None)
-                if result and isinstance(result, str) and os.path.exists(result):
-                    return result
-                logger.error(f"FLUX result not a valid file path: {type(result).__name__!r} = {result!r}")
-                return None
-            except AppError as e:
-                # HF space often returns RuntimeError (OOM, queue timeout, or backend error) on free tier; retry
-                if attempt < max_attempts:
-                    wait = delays[attempt - 1] if attempt <= len(delays) else delays[-1]
-                    logger.warning("FLUX AppError (attempt %s/%s), retry in %ss: %s", attempt, max_attempts, wait, e)
-                    time.sleep(wait)
-                else:
-                    logger.exception("FLUX AI Error after %s attempts: %s", max_attempts, e)
-                    return None
-            except Exception as e:
-                logger.exception("FLUX AI Error: %s (full: %r)", e, e)
-                return None
-        return None
+        try:
+            # Gemini uses aspect ratios or specific dims depending on the version
+            response = self.model.generate_content(prompt)
+
+            # The SDK often handles file saving; if it returns bytes:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+                        tmp.write(part.inline_data.data)
+                        return tmp.name
+            logger.error("Gemini Image: No data in response") 
+            return None
+        except Exception as e:
+            logger.exception(f"Gemini Image Error: {e}")
+            return None
 
 class VoiceGenerator:
     def __init__(self):
-        self.available_voices = {
-            'Matthew': 'Male (US)', 'Joanna': 'Female (US)', 'Ruth': 'Female (US)',
-            'Stephen': 'Male (US)', 'Amy': 'Female (British)', 'Brian': 'Male (British)'
-        }
-        try:
-            self.client = boto3.client(
-                'polly',
-                region_name=getattr(settings, 'AWS_REGION', 'us-east-1'),
-                aws_access_key_id=getattr(settings, 'AWS_ACCESS_KEY_ID', None),
-                aws_secret_access_key=getattr(settings, 'AWS_SECRET_ACCESS_KEY', None)
-            )
-        except Exception as e:
-            logger.error(f"AWS Polly Init Failed: {e}")
-            self.client = None 
-
-
-    def get_available_voices(self):
-        """Returns the dictionary of voices for the UI dropdown"""
-        return self.available_voices
-
+        # We use a list to match your available_voices logic
+        self.available_voices = ['Aoide', 'Charon', 'Fenrir', 'Kore', 'Puck']
+        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'), transport='rest')
+        self.model = genai.GenerativeModel('gemini-2.5-flash-tts')
+    
     def clean_narration_text(self, text):
         """Removes [Scene Descriptions] and (Parentheticals)"""
         if not text: return ""
         cleaned_text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
         cleaned_text = re.sub(r'(?i)^(scene|description):\s*', '', cleaned_text)
         return re.sub(r'\s+', ' ', cleaned_text).strip()
+        
+    def get_available_voices(self):
+        """Returns the list of voices for the UI dropdown"""
+        return self.available_voices
 
-    def generate_voiceover(self, text, voice_id='Matthew'):
+    def generate_voiceover(self, text, voice_id='Puck'):
         try:
             narration_text = self.clean_narration_text(text)
             if not narration_text: return None
 
-            response = self.client.synthesize_speech(
-                Text=narration_text[:2999],
-                OutputFormat='mp3',
-                VoiceId=voice_id,
-                Engine='neural'
+            # For older SDK versions, speech_config goes INSIDE generation_config
+            response = self.model.generate_content(
+                contents=narration_text,
+                generation_config={
+                    "response_mime_type": "audio/mpeg",
+                    "speech_config": {
+                        "voice_config": {
+                            "name": voice_id
+                        }
+                    }
+                }
             )
 
-            # Use delete=False so tasks.py can move the file before it's destroyed
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp:
-                tmp.write(response['AudioStream'].read())
-                return tmp.name
-        except Exception as e:
-            logger.error(f"Polly Error: {str(e)}")
+            # Standard path to access inline audio bytes
+            if response.candidates and response.candidates[0].content.parts:
+                part = response.candidates[0].content.parts[0]
+                if hasattr(part, 'inline_data'):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp:
+                        tmp.write(part.inline_data.data)
+                        return tmp.name
+            
+            logger.error("Gemini TTS: No audio data returned.")
             return None
+        except Exception as e:
+            logger.error(f"Gemini TTS Error: {e}")
+            return None
+
 
 class VideoEditor:
     @staticmethod
